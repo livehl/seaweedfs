@@ -2,7 +2,7 @@ package erasure_coding
 
 import (
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+	"io"
 	"os"
 	"path"
 	"strconv"
@@ -10,6 +10,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 type ShardId uint8
@@ -39,13 +40,22 @@ func NewEcVolumeShard(diskType types.DiskType, dirname string, collection string
 	}
 	ecdFi, statErr := v.ecdFile.Stat()
 	if statErr != nil {
+		_ = v.ecdFile.Close()
 		return nil, fmt.Errorf("can not stat ec volume shard %s%s: %v", baseFileName, ToExt(int(shardId)), statErr)
 	}
 	v.ecdFileSize = ecdFi.Size()
 
-	stats.VolumeServerVolumeCounter.WithLabelValues(v.Collection, "ec_shards").Inc()
+	v.Mount()
 
 	return
+}
+
+func (shard *EcVolumeShard) Mount() {
+	stats.VolumeServerVolumeGauge.WithLabelValues(shard.Collection, "ec_shards").Inc()
+}
+
+func (shard *EcVolumeShard) Unmount() {
+	stats.VolumeServerVolumeGauge.WithLabelValues(shard.Collection, "ec_shards").Dec()
 }
 
 func (shard *EcVolumeShard) Size() int64 {
@@ -86,12 +96,16 @@ func (shard *EcVolumeShard) Close() {
 }
 
 func (shard *EcVolumeShard) Destroy() {
+	shard.Unmount()
 	os.Remove(shard.FileName() + ToExt(int(shard.ShardId)))
-	stats.VolumeServerVolumeCounter.WithLabelValues(shard.Collection, "ec_shards").Dec()
 }
 
 func (shard *EcVolumeShard) ReadAt(buf []byte, offset int64) (int, error) {
 
-	return shard.ecdFile.ReadAt(buf, offset)
+	n, err := shard.ecdFile.ReadAt(buf, offset)
+	if err == io.EOF && n == len(buf) {
+		err = nil
+	}
+	return n, err
 
 }

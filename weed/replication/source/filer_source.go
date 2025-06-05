@@ -15,6 +15,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 type ReplicationSource interface {
@@ -28,10 +29,12 @@ type FilerSource struct {
 	address        string
 	proxyByFiler   bool
 	dataCenter     string
+	signature      int32
 }
 
 func (fs *FilerSource) Initialize(configuration util.Configuration, prefix string) error {
 	fs.dataCenter = configuration.GetString(prefix + "dataCenter")
+	fs.signature = util.RandomInt32()
 	return fs.DoInitialize(
 		"",
 		configuration.GetString(prefix+"grpcAddress"),
@@ -52,7 +55,7 @@ func (fs *FilerSource) DoInitialize(address, grpcAddress string, dir string, rea
 	return nil
 }
 
-func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) {
+func (fs *FilerSource) LookupFileId(ctx context.Context, part string) (fileUrls []string, err error) {
 
 	vid2Locations := make(map[string]*filer_pb.Locations)
 
@@ -60,7 +63,7 @@ func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) 
 
 	err = fs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
 
-		resp, err := client.LookupVolume(context.Background(), &filer_pb.LookupVolumeRequest{
+		resp, err := client.LookupVolume(ctx, &filer_pb.LookupVolumeRequest{
 			VolumeIds: []string{vid},
 		})
 		if err != nil {
@@ -104,16 +107,16 @@ func (fs *FilerSource) LookupFileId(part string) (fileUrls []string, err error) 
 func (fs *FilerSource) ReadPart(fileId string) (filename string, header http.Header, resp *http.Response, err error) {
 
 	if fs.proxyByFiler {
-		return util.DownloadFile("http://"+fs.address+"/?proxyChunkId="+fileId, "")
+		return util_http.DownloadFile("http://"+fs.address+"/?proxyChunkId="+fileId, "")
 	}
 
-	fileUrls, err := fs.LookupFileId(fileId)
+	fileUrls, err := fs.LookupFileId(context.Background(), fileId)
 	if err != nil {
 		return "", nil, nil, err
 	}
 
 	for _, fileUrl := range fileUrls {
-		filename, header, resp, err = util.DownloadFile(fileUrl, "")
+		filename, header, resp, err = util_http.DownloadFile(fileUrl, "")
 		if err != nil {
 			glog.V(1).Infof("fail to read from %s: %v", fileUrl, err)
 		} else {
@@ -128,7 +131,7 @@ var _ = filer_pb.FilerClient(&FilerSource{})
 
 func (fs *FilerSource) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 
-	return pb.WithGrpcClient(streamingMode, func(grpcConnection *grpc.ClientConn) error {
+	return pb.WithGrpcClient(streamingMode, fs.signature, func(grpcConnection *grpc.ClientConn) error {
 		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
 	}, fs.grpcAddress, false, fs.grpcDialOption)

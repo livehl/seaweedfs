@@ -2,10 +2,10 @@ package weed_server
 
 import (
 	"bytes"
-	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
-	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 	"io"
 	"math"
 	"mime"
@@ -14,6 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
+	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -66,12 +70,14 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, entry *filer.Ent
 	ifModifiedSinceHeader := r.Header.Get("If-Modified-Since")
 	if ifNoneMatchETagHeader != "" {
 		if util.CanonicalizeETag(etag) == util.CanonicalizeETag(ifNoneMatchETagHeader) {
+			SetEtag(w, etag)
 			w.WriteHeader(http.StatusNotModified)
 			return true
 		}
 	} else if ifModifiedSinceHeader != "" {
 		if t, parseError := time.Parse(http.TimeFormat, ifModifiedSinceHeader); parseError == nil {
 			if !t.Before(entry.Attr.Mtime) {
+				SetEtag(w, etag)
 				w.WriteHeader(http.StatusNotModified)
 				return true
 			}
@@ -82,14 +88,14 @@ func checkPreconditions(w http.ResponseWriter, r *http.Request, entry *filer.Ent
 }
 
 func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) {
-
+	ctx := r.Context()
 	path := r.URL.Path
 	isForDirectory := strings.HasSuffix(path, "/")
 	if isForDirectory && len(path) > 1 {
 		path = path[:len(path)-1]
 	}
 
-	entry, err := fs.filer.FindEntry(context.Background(), util.FullPath(path))
+	entry, err := fs.filer.FindEntry(ctx, util.FullPath(path))
 	if err != nil {
 		if path == "/" {
 			fs.listDirectoryHandler(w, r)
@@ -97,53 +103,81 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		}
 		if err == filer_pb.ErrNotFound {
 			glog.V(2).Infof("Not found %s: %v", path, err)
-			stats.FilerRequestCounter.WithLabelValues(stats.ErrorReadNotFound).Inc()
+			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadNotFound).Inc()
 			w.WriteHeader(http.StatusNotFound)
 		} else {
 			glog.Errorf("Internal %s: %v", path, err)
-			stats.FilerRequestCounter.WithLabelValues(stats.ErrorReadInternal).Inc()
+			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadInternal).Inc()
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 		return
 	}
 
+	query := r.URL.Query()
+
 	if entry.IsDirectory() {
 		if fs.option.DisableDirListing {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			w.WriteHeader(http.StatusForbidden)
 			return
 		}
-		if entry.Attr.Mime == "" {
+		if query.Get("metadata") == "true" {
+			writeJsonQuiet(w, r, http.StatusOK, entry)
+			return
+		}
+		if entry.Attr.Mime == "" || (entry.Attr.Mime == s3_constants.FolderMimeType && r.Header.Get(s3_constants.AmzIdentityId) == "") {
+			// Don't return directory meta if config value is set to true
+			if fs.option.ExposeDirectoryData == false {
+				writeJsonError(w, r, http.StatusForbidden, errors.New("directory listing is disabled"))
+				return
+			}
+			// return index of directory for non s3 gateway
 			fs.listDirectoryHandler(w, r)
 			return
 		}
 		// inform S3 API this is a user created directory key object
-		w.Header().Set(s3_constants.X_SeaweedFS_Header_Directory_Key, "true")
+		w.Header().Set(s3_constants.SeaweedFSIsDirectoryKey, "true")
 	}
 
-	if isForDirectory {
+	if isForDirectory && entry.Attr.Mime != s3_constants.FolderMimeType {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	query := r.URL.Query()
 	if query.Get("metadata") == "true" {
 		if query.Get("resolveManifest") == "true" {
 			if entry.Chunks, _, err = filer.ResolveChunkManifest(
+				ctx,
 				fs.filer.MasterClient.GetLookupFileIdFunction(),
-				entry.Chunks, 0, math.MaxInt64); err != nil {
+				entry.GetChunks(), 0, math.MaxInt64); err != nil {
 				err = fmt.Errorf("failed to resolve chunk manifest, err: %s", err.Error())
 				writeJsonError(w, r, http.StatusInternalServerError, err)
+				return
 			}
 		}
 		writeJsonQuiet(w, r, http.StatusOK, entry)
 		return
 	}
 
-	etag := filer.ETagEntry(entry)
 	if checkPreconditions(w, r, entry) {
 		return
 	}
 
+	var etag string
+	if partNumber, errNum := strconv.Atoi(r.Header.Get(s3_constants.SeaweedFSPartNumber)); errNum == nil {
+		if len(entry.Chunks) < partNumber {
+			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadChunk).Inc()
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte("InvalidPart"))
+			return
+		}
+		w.Header().Set(s3_constants.AmzMpPartsCount, strconv.Itoa(len(entry.Chunks)))
+		partChunk := entry.GetChunks()[partNumber-1]
+		md5, _ := base64.StdEncoding.DecodeString(partChunk.ETag)
+		etag = hex.EncodeToString(md5)
+		r.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", partChunk.Offset, uint64(partChunk.Offset)+partChunk.Size-1))
+	} else {
+		etag = filer.ETagEntry(entry)
+	}
 	w.Header().Set("Accept-Ranges", "bytes")
 
 	// mime type
@@ -155,6 +189,8 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 	}
 	if mimeType != "" {
 		w.Header().Set("Content-Type", mimeType)
+	} else {
+		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 
 	// print out the header from extended properties
@@ -186,14 +222,13 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		w.Header().Set(s3_constants.AmzTagCount, strconv.Itoa(tagCount))
 	}
 
-	setEtag(w, etag)
+	SetEtag(w, etag)
 
 	filename := entry.Name()
-	adjustPassthroughHeaders(w, r, filename)
-
+	AdjustPassthroughHeaders(w, r, filename)
 	totalSize := int64(entry.Size())
 
-	if r.Method == "HEAD" {
+	if r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
 		return
 	}
@@ -207,7 +242,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		if shouldResize {
 			data := mem.Allocate(int(totalSize))
 			defer mem.Free(data)
-			err := filer.ReadAll(data, fs.filer.MasterClient, entry.Chunks)
+			err := filer.ReadAll(ctx, data, fs.filer.MasterClient, entry.GetChunks())
 			if err != nil {
 				glog.Errorf("failed to read %s: %v", path, err)
 				w.WriteHeader(http.StatusInternalServerError)
@@ -219,35 +254,49 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	processRangeRequest(r, w, totalSize, mimeType, func(writer io.Writer, offset int64, size int64) error {
+	ProcessRangeRequest(r, w, totalSize, mimeType, func(offset int64, size int64) (filer.DoStreamContent, error) {
 		if offset+size <= int64(len(entry.Content)) {
-			_, err := writer.Write(entry.Content[offset : offset+size])
-			if err != nil {
-				stats.FilerRequestCounter.WithLabelValues(stats.ErrorWriteEntry).Inc()
-				glog.Errorf("failed to write entry content: %v", err)
-			}
-			return err
+			return func(writer io.Writer) error {
+				_, err := writer.Write(entry.Content[offset : offset+size])
+				if err != nil {
+					stats.FilerHandlerCounter.WithLabelValues(stats.ErrorWriteEntry).Inc()
+					glog.Errorf("failed to write entry content: %v", err)
+				}
+				return err
+			}, nil
 		}
-		chunks := entry.Chunks
+		chunks := entry.GetChunks()
 		if entry.IsInRemoteOnly() {
 			dir, name := entry.FullPath.DirAndName()
-			if resp, err := fs.CacheRemoteObjectToLocalCluster(context.Background(), &filer_pb.CacheRemoteObjectToLocalClusterRequest{
+			if resp, err := fs.CacheRemoteObjectToLocalCluster(ctx, &filer_pb.CacheRemoteObjectToLocalClusterRequest{
 				Directory: dir,
 				Name:      name,
 			}); err != nil {
-				stats.FilerRequestCounter.WithLabelValues(stats.ErrorReadCache).Inc()
+				stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadCache).Inc()
 				glog.Errorf("CacheRemoteObjectToLocalCluster %s: %v", entry.FullPath, err)
-				return fmt.Errorf("cache %s: %v", entry.FullPath, err)
+				return nil, fmt.Errorf("cache %s: %v", entry.FullPath, err)
 			} else {
-				chunks = resp.Entry.Chunks
+				chunks = resp.Entry.GetChunks()
 			}
 		}
 
-		err = filer.StreamContentWithThrottler(fs.filer.MasterClient, writer, chunks, offset, size, fs.option.DownloadMaxBytesPs)
+		streamFn, err := filer.PrepareStreamContentWithThrottler(ctx, fs.filer.MasterClient, fs.maybeGetVolumeReadJwtAuthorizationToken, chunks, offset, size, fs.option.DownloadMaxBytesPs)
 		if err != nil {
-			stats.FilerRequestCounter.WithLabelValues(stats.ErrorReadStream).Inc()
-			glog.Errorf("failed to stream content %s: %v", r.URL, err)
+			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
+			glog.Errorf("failed to prepare stream content %s: %v", r.URL, err)
+			return nil, err
 		}
-		return err
+		return func(writer io.Writer) error {
+			err := streamFn(writer)
+			if err != nil {
+				stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
+				glog.Errorf("failed to stream content %s: %v", r.URL, err)
+			}
+			return err
+		}, nil
 	})
+}
+
+func (fs *FilerServer) maybeGetVolumeReadJwtAuthorizationToken(fileId string) string {
+	return string(security.GenJwtForVolumeServer(fs.volumeGuard.ReadSigningKey, fs.volumeGuard.ReadExpiresAfterSec, fileId))
 }

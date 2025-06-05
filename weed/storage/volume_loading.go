@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+
 	"github.com/syndtr/goleveldb/leveldb/opt"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -41,11 +43,18 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 
 	hasVolumeInfoFile := v.maybeLoadVolumeInfo()
 
+	if v.volumeInfo.ReadOnly && !v.HasRemoteFile() {
+		// this covers the case where the volume is marked as read-only and has no remote file
+		v.noWriteOrDelete = true
+	}
+
 	if v.HasRemoteFile() {
 		v.noWriteCanDelete = true
 		v.noWriteOrDelete = false
 		glog.V(0).Infof("loading volume %d from remote %v", v.Id, v.volumeInfo)
-		v.LoadRemoteFile()
+		if err := v.LoadRemoteFile(); err != nil {
+			return fmt.Errorf("load remote file %v: %v", v.volumeInfo, err)
+		}
 		alreadyHasSuperBlock = true
 	} else if exists, canRead, canWrite, modifiedTime, fileSize := util.CheckFile(v.FileName(".dat")); exists {
 		// open dat file
@@ -121,9 +130,17 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 				return fmt.Errorf("cannot write Volume Index %s: %v", v.FileName(".idx"), err)
 			}
 		}
-		if v.lastAppendAtNs, err = CheckAndFixVolumeDataIntegrity(v, indexFile); err != nil {
-			v.noWriteOrDelete = true
-			glog.V(0).Infof("volumeDataIntegrityChecking failed %v", err)
+		// Do not need to check the data integrity for remote volumes,
+		// since the remote storage tier may have larger capacity, the volume
+		// data read will trigger the ReadAt() function to read from the remote
+		// storage tier, and download to local storage, which may cause the
+		// capactiy overloading.
+		if !v.HasRemoteFile() {
+			glog.V(0).Infof("checking volume data integrity for volume %d", v.Id)
+			if v.lastAppendAtNs, err = CheckVolumeDataIntegrity(v, indexFile); err != nil {
+				v.noWriteOrDelete = true
+				glog.V(0).Infof("volumeDataIntegrityChecking failed %v", err)
+			}
 		}
 
 		if v.noWriteOrDelete || v.noWriteCanDelete {
@@ -135,7 +152,7 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 			case NeedleMapInMemory:
 				if v.tmpNm != nil {
 					glog.V(0).Infof("updating memory compact index %s ", v.FileName(".idx"))
-					err = v.tmpNm.UpdateNeedleMap(v, indexFile, nil)
+					err = v.tmpNm.UpdateNeedleMap(v, indexFile, nil, 0)
 				} else {
 					glog.V(0).Infoln("loading memory index", v.FileName(".idx"), "to memory")
 					if v.nm, err = LoadCompactNeedleMap(indexFile); err != nil {
@@ -150,10 +167,10 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 				}
 				if v.tmpNm != nil {
 					glog.V(0).Infoln("updating leveldb index", v.FileName(".ldb"))
-					err = v.tmpNm.UpdateNeedleMap(v, indexFile, opts)
+					err = v.tmpNm.UpdateNeedleMap(v, indexFile, opts, v.ldbTimeout)
 				} else {
 					glog.V(0).Infoln("loading leveldb index", v.FileName(".ldb"))
-					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts); err != nil {
+					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout); err != nil {
 						glog.V(0).Infof("loading leveldb %s error: %v", v.FileName(".ldb"), err)
 					}
 				}
@@ -165,10 +182,10 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 				}
 				if v.tmpNm != nil {
 					glog.V(0).Infoln("updating leveldb medium index", v.FileName(".ldb"))
-					err = v.tmpNm.UpdateNeedleMap(v, indexFile, opts)
+					err = v.tmpNm.UpdateNeedleMap(v, indexFile, opts, v.ldbTimeout)
 				} else {
 					glog.V(0).Infoln("loading leveldb medium index", v.FileName(".ldb"))
-					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts); err != nil {
+					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout); err != nil {
 						glog.V(0).Infof("loading leveldb %s error: %v", v.FileName(".ldb"), err)
 					}
 				}
@@ -180,10 +197,10 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 				}
 				if v.tmpNm != nil {
 					glog.V(0).Infoln("updating leveldb large index", v.FileName(".ldb"))
-					err = v.tmpNm.UpdateNeedleMap(v, indexFile, opts)
+					err = v.tmpNm.UpdateNeedleMap(v, indexFile, opts, v.ldbTimeout)
 				} else {
 					glog.V(0).Infoln("loading leveldb large index", v.FileName(".ldb"))
-					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts); err != nil {
+					if v.nm, err = NewLevelDbNeedleMap(v.FileName(".ldb"), indexFile, opts, v.ldbTimeout); err != nil {
 						glog.V(0).Infof("loading leveldb %s error: %v", v.FileName(".ldb"), err)
 					}
 				}
@@ -193,10 +210,13 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 
 	if !hasVolumeInfoFile {
 		v.volumeInfo.Version = uint32(v.SuperBlock.Version)
-		v.SaveVolumeInfo()
+		v.volumeInfo.BytesOffset = uint32(types.OffsetSize)
+		if err := v.SaveVolumeInfo(); err != nil {
+			glog.Warningf("volume %d failed to save file info: %v", v.Id, err)
+		}
 	}
 
-	stats.VolumeServerVolumeCounter.WithLabelValues(v.Collection, "volume").Inc()
+	stats.VolumeServerVolumeGauge.WithLabelValues(v.Collection, "volume").Inc()
 
 	if err == nil {
 		hasLoadedVolume = true

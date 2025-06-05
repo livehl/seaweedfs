@@ -32,6 +32,7 @@ var Commands = []*Command{
 	cmdMaster,
 	cmdMasterFollower,
 	cmdMount,
+	cmdMqAgent,
 	cmdMqBroker,
 	cmdS3,
 	cmdScaffold,
@@ -42,6 +43,7 @@ var Commands = []*Command{
 	cmdVersion,
 	cmdVolume,
 	cmdWebDav,
+	cmdSftp,
 }
 
 type Command struct {

@@ -26,7 +26,7 @@ type RemoteSyncOptions struct {
 var _ = filer_pb.FilerClient(&RemoteSyncOptions{})
 
 func (option *RemoteSyncOptions) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
-	return pb.WithFilerClient(streamingMode, pb.ServerAddress(*option.filerAddress), option.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	return pb.WithFilerClient(streamingMode, option.clientId, pb.ServerAddress(*option.filerAddress), option.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		return fn(client)
 	})
 }
@@ -73,7 +73,7 @@ var cmdFilerRemoteSynchronize = &Command{
 
 func runFilerRemoteSynchronize(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
 	remoteSyncOptions.grpcDialOption = grpcDialOption
 
@@ -90,7 +90,7 @@ func runFilerRemoteSynchronize(cmd *Command, args []string) bool {
 
 	if dir != "" {
 		fmt.Printf("synchronize %s to remote storage...\n", dir)
-		util.RetryForever("filer.remote.sync "+dir, func() error {
+		util.RetryUntil("filer.remote.sync "+dir, func() error {
 			return followUpdatesAndUploadToRemote(&remoteSyncOptions, filerSource, dir)
 		}, func(err error) bool {
 			if err != nil {

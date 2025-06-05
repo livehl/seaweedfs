@@ -49,8 +49,10 @@ func (vs *VolumeServer) FetchAndWriteNeedle(ctx context.Context, req *volume_ser
 		n.SetHasLastModifiedDate()
 		if _, localWriteErr := vs.store.WriteVolumeNeedle(v.Id, n, true, false); localWriteErr != nil {
 			if err == nil {
-				err = fmt.Errorf("local write needle %d size %d: %v", req.NeedleId, req.Size, err)
+				err = fmt.Errorf("local write needle %d size %d: %v", req.NeedleId, req.Size, localWriteErr)
 			}
+		} else {
+			resp.ETag = n.Etag()
 		}
 	}()
 	if len(req.Replicas) > 0 {
@@ -68,10 +70,15 @@ func (vs *VolumeServer) FetchAndWriteNeedle(ctx context.Context, req *volume_ser
 					PairMap:           nil,
 					Jwt:               security.EncodedJwt(req.Auth),
 				}
-				if _, replicaWriteErr := operation.UploadData(data, uploadOption); replicaWriteErr != nil {
-					if err == nil {
-						err = fmt.Errorf("remote write needle %d size %d: %v", req.NeedleId, req.Size, err)
-					}
+
+				uploader, uploaderErr := operation.NewUploader()
+				if uploaderErr != nil && err == nil {
+					err = fmt.Errorf("remote write needle %d size %d: %v", req.NeedleId, req.Size, uploaderErr)
+					return
+				}
+
+				if _, replicaWriteErr := uploader.UploadData(ctx, data, uploadOption); replicaWriteErr != nil && err == nil {
+					err = fmt.Errorf("remote write needle %d size %d: %v", req.NeedleId, req.Size, replicaWriteErr)
 				}
 			}(replica.Url)
 		}

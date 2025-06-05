@@ -32,6 +32,7 @@ type VolumeServer struct {
 	readBufferSizeMB              int
 
 	SeedMasterNodes []pb.ServerAddress
+	whiteList       []string
 	currentMaster   pb.ServerAddress
 	pulseSeconds    int
 	dataCenter      string
@@ -41,6 +42,7 @@ type VolumeServer struct {
 	grpcDialOption  grpc.DialOption
 
 	needleMapKind           storage.NeedleMapKind
+	ldbTimout               int64
 	FixJpgOrientation       bool
 	ReadMode                string
 	compactionBytePerSecond int64
@@ -68,6 +70,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	inflightUploadDataTimeout time.Duration,
 	hasSlowRead bool,
 	readBufferSizeMB int,
+	ldbTimeout int64,
 ) *VolumeServer {
 
 	v := util.GetViper()
@@ -99,31 +102,35 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 		inflightUploadDataTimeout:     inflightUploadDataTimeout,
 		hasSlowRead:                   hasSlowRead,
 		readBufferSizeMB:              readBufferSizeMB,
+		ldbTimout:                     ldbTimeout,
+		whiteList:                     whiteList,
 	}
+
+	whiteList = append(whiteList, util.StringSplit(v.GetString("guard.white_list"), ",")...)
 	vs.SeedMasterNodes = masterNodes
 
 	vs.checkWithMaster()
 
-	vs.store = storage.NewStore(vs.grpcDialOption, ip, port, grpcPort, publicUrl, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes)
+	vs.store = storage.NewStore(vs.grpcDialOption, ip, port, grpcPort, publicUrl, folders, maxCounts, minFreeSpaces, idxFolder, vs.needleMapKind, diskTypes, ldbTimeout)
 	vs.guard = security.NewGuard(whiteList, signingKey, expiresAfterSec, readSigningKey, readExpiresAfterSec)
 
 	handleStaticResources(adminMux)
-	adminMux.HandleFunc("/status", vs.statusHandler)
-	adminMux.HandleFunc("/healthz", vs.healthzHandler)
+	adminMux.HandleFunc("/status", requestIDMiddleware(vs.statusHandler))
+	adminMux.HandleFunc("/healthz", requestIDMiddleware(vs.healthzHandler))
 	if signingKey == "" || enableUiAccess {
 		// only expose the volume server details for safe environments
-		adminMux.HandleFunc("/ui/index.html", vs.uiStatusHandler)
+		adminMux.HandleFunc("/ui/index.html", requestIDMiddleware(vs.uiStatusHandler))
 		/*
 			adminMux.HandleFunc("/stats/counter", vs.guard.WhiteList(statsCounterHandler))
 			adminMux.HandleFunc("/stats/memory", vs.guard.WhiteList(statsMemoryHandler))
 			adminMux.HandleFunc("/stats/disk", vs.guard.WhiteList(vs.statsDiskHandler))
 		*/
 	}
-	adminMux.HandleFunc("/", vs.privateStoreHandler)
+	adminMux.HandleFunc("/", requestIDMiddleware(vs.privateStoreHandler))
 	if publicMux != adminMux {
 		// separated admin and public port
 		handleStaticResources(publicMux)
-		publicMux.HandleFunc("/", vs.publicReadOnlyHandler)
+		publicMux.HandleFunc("/", requestIDMiddleware(vs.publicReadOnlyHandler))
 	}
 
 	go vs.heartbeat()
@@ -146,4 +153,12 @@ func (vs *VolumeServer) Shutdown() {
 	glog.V(0).Infoln("Shutting down volume server...")
 	vs.store.Close()
 	glog.V(0).Infoln("Shut down successfully!")
+}
+
+func (vs *VolumeServer) Reload() {
+	glog.V(0).Infoln("Reload volume server...")
+
+	util.LoadConfiguration("security", false)
+	v := util.GetViper()
+	vs.guard.UpdateWhiteList(append(vs.whiteList, util.StringSplit(v.GetString("guard.white_list"), ",")...))
 }

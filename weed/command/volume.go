@@ -2,6 +2,7 @@ package command
 
 import (
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"net/http"
 	httppprof "net/http/pprof"
 	"os"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
+	"github.com/seaweedfs/seaweedfs/weed/server/constants"
 	"github.com/seaweedfs/seaweedfs/weed/util/httpdown"
 
 	"google.golang.org/grpc/reflection"
@@ -64,10 +66,12 @@ type VolumeServerOptions struct {
 	pprof                     *bool
 	preStopSeconds            *int
 	metricsHttpPort           *int
+	metricsHttpIp             *string
 	// pulseSeconds          *int
 	inflightUploadDataTimeout *time.Duration
 	hasSlowRead               *bool
 	readBufferSizeMB          *int
+	ldbTimeout                *int64
 }
 
 func init() {
@@ -92,13 +96,15 @@ func init() {
 	v.memProfile = cmdVolume.Flag.String("memprofile", "", "memory profile output file")
 	v.compactionMBPerSecond = cmdVolume.Flag.Int("compactionMBps", 0, "limit background compaction or copying speed in mega bytes per second")
 	v.fileSizeLimitMB = cmdVolume.Flag.Int("fileSizeLimitMB", 256, "limit file size to avoid out of memory")
+	v.ldbTimeout = cmdVolume.Flag.Int64("index.leveldbTimeout", 0, "alive time for leveldb (default to 0). If leveldb of volume is not accessed in ldbTimeout hours, it will be off loaded to reduce opened files and memory consumption.")
 	v.concurrentUploadLimitMB = cmdVolume.Flag.Int("concurrentUploadLimitMB", 256, "limit total concurrent upload size")
 	v.concurrentDownloadLimitMB = cmdVolume.Flag.Int("concurrentDownloadLimitMB", 256, "limit total concurrent download size")
 	v.pprof = cmdVolume.Flag.Bool("pprof", false, "enable pprof http handlers. precludes --memprofile and --cpuprofile")
 	v.metricsHttpPort = cmdVolume.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
+	v.metricsHttpIp = cmdVolume.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
 	v.idxFolder = cmdVolume.Flag.String("dir.idx", "", "directory to store .idx files")
 	v.inflightUploadDataTimeout = cmdVolume.Flag.Duration("inflightUploadDataTimeout", 60*time.Second, "inflight upload data wait timeout of volume servers")
-	v.hasSlowRead = cmdVolume.Flag.Bool("hasSlowRead", false, "<experimental> if true, this prevents slow reads from blocking other requests, but large file read P99 latency will increase.")
+	v.hasSlowRead = cmdVolume.Flag.Bool("hasSlowRead", true, "<experimental> if true, this prevents slow reads from blocking other requests, but large file read P99 latency will increase.")
 	v.readBufferSizeMB = cmdVolume.Flag.Int("readBufferSizeMB", 4, "<experimental> larger values can optimize query performance but will increase some memory usage,Use with hasSlowRead normally.")
 }
 
@@ -120,7 +126,7 @@ var (
 
 func runVolume(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 
 	// If --pprof is set we assume the caller wants to be able to collect
 	// cpu and memory profiles via go tool pprof
@@ -128,7 +134,15 @@ func runVolume(cmd *Command, args []string) bool {
 		grace.SetupProfiling(*v.cpuProfile, *v.memProfile)
 	}
 
-	go stats_collect.StartMetricsServer(*v.metricsHttpPort)
+	switch {
+	case *v.metricsHttpIp != "":
+		// noting to do, use v.metricsHttpIp
+	case *v.bindIp != "":
+		*v.metricsHttpIp = *v.bindIp
+	case *v.ip != "":
+		*v.metricsHttpIp = *v.ip
+	}
+	go stats_collect.StartMetricsServer(*v.metricsHttpIp, *v.metricsHttpPort)
 
 	minFreeSpaces := util.MustParseMinFreeSpace(*minFreeSpace, *minFreeSpacePercent)
 	v.masters = pb.ServerAddresses(*v.mastersString).ToAddresses()
@@ -239,7 +253,7 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		v.folders, v.folderMaxLimits, minFreeSpaces, diskTypes,
 		*v.idxFolder,
 		volumeNeedleMapKind,
-		v.masters, 5, *v.dataCenter, *v.rack,
+		v.masters, constants.VolumePulseSeconds, *v.dataCenter, *v.rack,
 		v.whiteList,
 		*v.fixJpgOrientation, *v.readMode,
 		*v.compactionMBPerSecond,
@@ -249,6 +263,7 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		*v.inflightUploadDataTimeout,
 		*v.hasSlowRead,
 		*v.readBufferSizeMB,
+		*v.ldbTimeout,
 	)
 	// starting grpc server
 	grpcS := v.startGrpcService(volumeServer)
@@ -266,6 +281,7 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 	clusterHttpServer := v.startClusterHttpService(volumeMux)
 
 	grace.OnReload(volumeServer.LoadNewVolumes)
+	grace.OnReload(volumeServer.Reload)
 
 	stopChan := make(chan bool)
 	grace.OnInterrupt(func() {
@@ -336,7 +352,7 @@ func (v VolumeServerOptions) startGrpcService(vs volume_server_pb.VolumeServerSe
 
 func (v VolumeServerOptions) startPublicHttpService(handler http.Handler) httpdown.Server {
 	publicListeningAddress := util.JoinHostPort(*v.bindIp, *v.publicPort)
-	glog.V(0).Infoln("Start Seaweed volume server", util.Version(), "public at", publicListeningAddress)
+	glog.V(0).Infoln("Start Seaweed volume server", version.Version(), "public at", publicListeningAddress)
 	publicListener, e := util.NewListener(publicListeningAddress, time.Duration(*v.idleConnectionTimeout)*time.Second)
 	if e != nil {
 		glog.Fatalf("Volume server listener error:%v", e)
@@ -363,7 +379,7 @@ func (v VolumeServerOptions) startClusterHttpService(handler http.Handler) httpd
 	}
 
 	listeningAddress := util.JoinHostPort(*v.bindIp, *v.port)
-	glog.V(0).Infof("Start Seaweed volume server %s at %s", util.Version(), listeningAddress)
+	glog.V(0).Infof("Start Seaweed volume server %s at %s", version.Version(), listeningAddress)
 	listener, e := util.NewListener(listeningAddress, time.Duration(*v.idleConnectionTimeout)*time.Second)
 	if e != nil {
 		glog.Fatalf("Volume server listener error:%v", e)

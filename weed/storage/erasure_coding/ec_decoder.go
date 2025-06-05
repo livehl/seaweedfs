@@ -150,8 +150,8 @@ func iterateEcjFile(baseFileName string, processNeedleFn func(key types.NeedleId
 
 }
 
-// WriteDatFile generates .dat from from .ec00 ~ .ec09 files
-func WriteDatFile(baseFileName string, datFileSize int64) error {
+// WriteDatFile generates .dat from .ec00 ~ .ec09 files
+func WriteDatFile(baseFileName string, datFileSize int64, shardFileNames []string) error {
 
 	datFile, openErr := os.OpenFile(baseFileName+".dat", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 	if openErr != nil {
@@ -161,20 +161,26 @@ func WriteDatFile(baseFileName string, datFileSize int64) error {
 
 	inputFiles := make([]*os.File, DataShardsCount)
 
+	defer func() {
+		for shardId := 0; shardId < DataShardsCount; shardId++ {
+			if inputFiles[shardId] != nil {
+				inputFiles[shardId].Close()
+			}
+		}
+	}()
+
 	for shardId := 0; shardId < DataShardsCount; shardId++ {
-		shardFileName := baseFileName + ToExt(shardId)
-		inputFiles[shardId], openErr = os.OpenFile(shardFileName, os.O_RDONLY, 0)
+		inputFiles[shardId], openErr = os.OpenFile(shardFileNames[shardId], os.O_RDONLY, 0)
 		if openErr != nil {
 			return openErr
 		}
-		defer inputFiles[shardId].Close()
 	}
 
 	for datFileSize >= DataShardsCount*ErasureCodingLargeBlockSize {
 		for shardId := 0; shardId < DataShardsCount; shardId++ {
 			w, err := io.CopyN(datFile, inputFiles[shardId], ErasureCodingLargeBlockSize)
 			if w != ErasureCodingLargeBlockSize {
-				return fmt.Errorf("copy %s large block %d: %v", baseFileName, shardId, err)
+				return fmt.Errorf("copy %s large block on shardId %d: %v", baseFileName, shardId, err)
 			}
 			datFileSize -= ErasureCodingLargeBlockSize
 		}

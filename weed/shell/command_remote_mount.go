@@ -44,6 +44,10 @@ func (c *commandRemoteMount) Help() string {
 `
 }
 
+func (c *commandRemoteMount) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandRemoteMount) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	remoteMountCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -134,7 +138,7 @@ func syncMetadata(commandEnv *CommandEnv, writer io.Writer, dir string, nonEmpty
 		}
 
 		mountToDirIsEmpty := true
-		listErr := filer_pb.SeaweedList(client, dir, "", func(entry *filer_pb.Entry, isLast bool) error {
+		listErr := filer_pb.SeaweedList(context.Background(), client, dir, "", func(entry *filer_pb.Entry, isLast bool) error {
 			mountToDirIsEmpty = false
 			return nil
 		}, "", false, 1)
@@ -182,6 +186,9 @@ func doSaveRemoteEntry(client filer_pb.SeaweedFilerClient, localDir string, exis
 	existingEntry.RemoteEntry = remoteEntry
 	existingEntry.Attributes.FileSize = uint64(remoteEntry.RemoteSize)
 	existingEntry.Attributes.Mtime = remoteEntry.RemoteMtime
+	existingEntry.Attributes.Md5 = nil
+	existingEntry.Chunks = nil
+	existingEntry.Content = nil
 	_, updateErr := client.UpdateEntry(context.Background(), &filer_pb.UpdateEntryRequest{
 		Directory: localDir,
 		Entry:     existingEntry,

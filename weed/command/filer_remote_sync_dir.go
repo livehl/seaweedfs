@@ -28,12 +28,13 @@ func followUpdatesAndUploadToRemote(option *RemoteSyncOptions, filerSource *sour
 		return fmt.Errorf("read mount info: %v", detectErr)
 	}
 
-	eachEntryFunc, err := makeEventProcessor(remoteStorage, mountedDir, remoteStorageMountLocation, filerSource)
+	eachEntryFunc, err := option.makeEventProcessor(remoteStorage, mountedDir, remoteStorageMountLocation, filerSource)
 	if err != nil {
 		return err
 	}
 
-	processor := NewMetadataProcessor(eachEntryFunc, 128)
+	lastOffsetTs := collectLastSyncOffset(option, option.grpcDialOption, pb.ServerAddress(*option.filerAddress), mountedDir, *option.timeAgo)
+	processor := NewMetadataProcessor(eachEntryFunc, 128, lastOffsetTs.UnixNano())
 
 	var lastLogTsNs = time.Now().UnixNano()
 	processEventFnWithOffset := pb.AddOffsetFunc(func(resp *filer_pb.SubscribeMetadataResponse) error {
@@ -50,24 +51,41 @@ func followUpdatesAndUploadToRemote(option *RemoteSyncOptions, filerSource *sour
 		processor.AddSyncJob(resp)
 		return nil
 	}, 3*time.Second, func(counter int64, lastTsNs int64) error {
-		if processor.processedTsWatermark == 0 {
+		offsetTsNs := processor.processedTsWatermark.Load()
+		if offsetTsNs == 0 {
 			return nil
 		}
 		// use processor.processedTsWatermark instead of the lastTsNs from the most recent job
 		now := time.Now().UnixNano()
-		glog.V(0).Infof("remote sync %s progressed to %v %0.2f/sec", *option.filerAddress, time.Unix(0, processor.processedTsWatermark), float64(counter)/(float64(now-lastLogTsNs)/1e9))
+		glog.V(0).Infof("remote sync %s progressed to %v %0.2f/sec", *option.filerAddress, time.Unix(0, offsetTsNs), float64(counter)/(float64(now-lastLogTsNs)/1e9))
 		lastLogTsNs = now
-		return remote_storage.SetSyncOffset(option.grpcDialOption, pb.ServerAddress(*option.filerAddress), mountedDir, processor.processedTsWatermark)
+		return remote_storage.SetSyncOffset(option.grpcDialOption, pb.ServerAddress(*option.filerAddress), mountedDir, offsetTsNs)
 	})
 
-	lastOffsetTs := collectLastSyncOffset(option, option.grpcDialOption, pb.ServerAddress(*option.filerAddress), mountedDir, *option.timeAgo)
-
 	option.clientEpoch++
-	return pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, "filer.remote.sync", option.clientId, option.clientEpoch,
-		mountedDir, []string{filer.DirectoryEtcRemote}, lastOffsetTs.UnixNano(), 0, 0, processEventFnWithOffset, pb.TrivialOnError)
+
+	prefix := mountedDir
+	if !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
+	}
+
+	metadataFollowOption := &pb.MetadataFollowOption{
+		ClientName:             "filer.remote.sync",
+		ClientId:               option.clientId,
+		ClientEpoch:            option.clientEpoch,
+		SelfSignature:          0,
+		PathPrefix:             prefix,
+		AdditionalPathPrefixes: []string{filer.DirectoryEtcRemote},
+		DirectoriesToWatch:     nil,
+		StartTsNs:              lastOffsetTs.UnixNano(),
+		StopTsNs:               0,
+		EventErrorType:         pb.RetryForeverOnError,
+	}
+
+	return pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, metadataFollowOption, processEventFnWithOffset)
 }
 
-func makeEventProcessor(remoteStorage *remote_pb.RemoteConf, mountedDir string, remoteStorageMountLocation *remote_pb.RemoteStorageLocation, filerSource *source.FilerSource) (pb.ProcessMetadataFunc, error) {
+func (option *RemoteSyncOptions) makeEventProcessor(remoteStorage *remote_pb.RemoteConf, mountedDir string, remoteStorageMountLocation *remote_pb.RemoteStorageLocation, filerSource *source.FilerSource) (pb.ProcessMetadataFunc, error) {
 	client, err := remote_storage.GetRemoteStorage(remoteStorage)
 	if err != nil {
 		return nil, err
@@ -139,7 +157,7 @@ func makeEventProcessor(remoteStorage *remote_pb.RemoteConf, mountedDir string, 
 			if writeErr != nil {
 				return writeErr
 			}
-			return updateLocalEntry(&remoteSyncOptions, message.NewParentPath, message.NewEntry, remoteEntry)
+			return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 		}
 		if filer_pb.IsDelete(resp) {
 			glog.V(2).Infof("delete: %+v", resp)
@@ -152,6 +170,9 @@ func makeEventProcessor(remoteStorage *remote_pb.RemoteConf, mountedDir string, 
 			return client.DeleteFile(dest)
 		}
 		if message.OldEntry != nil && message.NewEntry != nil {
+			if isMultipartUploadFile(message.NewParentPath, message.NewEntry.Name) {
+				return nil
+			}
 			oldDest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(resp.Directory, message.OldEntry.Name), remoteStorageMountLocation)
 			dest := toRemoteStorageLocation(util.FullPath(mountedDir), util.NewFullPath(message.NewParentPath, message.NewEntry.Name), remoteStorageMountLocation)
 			if !shouldSendToRemote(message.NewEntry) {
@@ -178,7 +199,7 @@ func makeEventProcessor(remoteStorage *remote_pb.RemoteConf, mountedDir string, 
 			if writeErr != nil {
 				return writeErr
 			}
-			return updateLocalEntry(&remoteSyncOptions, message.NewParentPath, message.NewEntry, remoteEntry)
+			return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 		}
 
 		return nil
@@ -209,7 +230,7 @@ func collectLastSyncOffset(filerClient filer_pb.FilerClient, grpcDialOption grpc
 	// 3. directory creation time
 	var lastOffsetTs time.Time
 	if timeAgo == 0 {
-		mountedDirEntry, err := filer_pb.GetEntry(filerClient, util.FullPath(mountedDir))
+		mountedDirEntry, err := filer_pb.GetEntry(context.Background(), filerClient, util.FullPath(mountedDir))
 		if err != nil {
 			glog.V(0).Infof("get mounted directory %s: %v", mountedDir, err)
 			return time.Now()
@@ -265,7 +286,10 @@ func updateLocalEntry(filerClient filer_pb.FilerClient, dir string, entry *filer
 }
 
 func isMultipartUploadFile(dir string, name string) bool {
+	return isMultipartUploadDir(dir) && strings.HasSuffix(name, ".part")
+}
+
+func isMultipartUploadDir(dir string) bool {
 	return strings.HasPrefix(dir, "/buckets/") &&
-		strings.Contains(dir, "/"+s3_constants.MultipartUploadsFolder+"/") &&
-		strings.HasSuffix(name, ".part")
+		strings.Contains(dir, "/"+s3_constants.MultipartUploadsFolder+"/")
 }

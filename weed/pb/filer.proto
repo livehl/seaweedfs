@@ -54,6 +54,9 @@ service SeaweedFiler {
     rpc GetFilerConfiguration (GetFilerConfigurationRequest) returns (GetFilerConfigurationResponse) {
     }
 
+    rpc TraverseBfsMetadata (TraverseBfsMetadataRequest) returns (stream TraverseBfsMetadataResponse) {
+    }
+
     rpc SubscribeMetadata (SubscribeMetadataRequest) returns (stream SubscribeMetadataResponse) {
     }
 
@@ -67,6 +70,16 @@ service SeaweedFiler {
     }
 
     rpc CacheRemoteObjectToLocalCluster (CacheRemoteObjectToLocalClusterRequest) returns (CacheRemoteObjectToLocalClusterResponse) {
+    }
+
+    rpc DistributedLock(LockRequest) returns (LockResponse) {
+    }
+    rpc DistributedUnlock(UnlockRequest) returns (UnlockResponse) {
+    }
+    rpc FindLockOwner(FindLockOwnerRequest) returns (FindLockOwnerResponse) {
+    }
+    // distributed lock management internal use only
+    rpc TransferLocks(TransferLocksRequest) returns (TransferLocksResponse) {
     }
 }
 
@@ -112,6 +125,7 @@ message Entry {
 
     RemoteEntry remote_entry = 10;
     int64 quota = 11; // for bucket only. Positive/Negative means enabled/disabled.
+    int64 worm_enforced_at_ts_ns = 12;
 }
 
 message FullEntry {
@@ -132,7 +146,7 @@ message FileChunk {
     string file_id = 1; // to be deprecated
     int64 offset = 2;
     uint64 size = 3;
-    int64 mtime = 4;
+    int64 modified_ts_ns = 4;
     string e_tag = 5;
     string source_file_id = 6; // to be deprecated
     FileId fid = 7;
@@ -208,6 +222,7 @@ message DeleteEntryRequest {
     bool ignore_recursive_error = 6;
     bool is_from_other_cluster = 7;
     repeated int32 signatures = 8;
+    int64 if_not_modified_after = 9;
 }
 
 message DeleteEntryResponse {
@@ -331,6 +346,8 @@ message GetFilerConfigurationResponse {
     string version = 11;
     string cluster_id = 12;
     string filer_group = 13;
+    int32 major_version = 14;
+    int32 minor_version = 15;
 }
 
 message SubscribeMetadataRequest {
@@ -350,10 +367,20 @@ message SubscribeMetadataResponse {
     int64 ts_ns = 3;
 }
 
+message TraverseBfsMetadataRequest {
+    string directory = 1;
+    repeated string excluded_prefixes = 2;
+}
+message TraverseBfsMetadataResponse {
+    string directory = 1;
+    Entry entry = 2;
+}
+
 message LogEntry {
     int64 ts_ns = 1;
     int32 partition_key_hash = 2;
     bytes data = 3;
+    bytes key = 4;
 }
 
 message KeepConnectedRequest {
@@ -414,6 +441,11 @@ message FilerConf {
         string data_center = 9;
         string rack = 10;
         string data_node = 11;
+        uint32 max_file_name_length = 12;
+        bool disable_chunk_deletion = 13;
+        bool worm = 14;
+        uint64 worm_grace_period_seconds = 15;
+        uint64 worm_retention_time_seconds = 16;
     }
     repeated PathConf locations = 2;
 }
@@ -427,4 +459,48 @@ message CacheRemoteObjectToLocalClusterRequest {
 }
 message CacheRemoteObjectToLocalClusterResponse {
     Entry entry = 1;
+}
+
+/////////////////////////
+// distributed lock management
+/////////////////////////
+message LockRequest {
+    string name = 1;
+    int64 seconds_to_lock = 2;
+    string renew_token = 3;
+    bool is_moved = 4;
+    string owner = 5;
+}
+message LockResponse {
+    string renew_token = 1;
+    string lock_owner = 2;
+    string lock_host_moved_to = 3;
+    string error = 4;
+}
+message UnlockRequest {
+    string name = 1;
+    string renew_token = 2;
+    bool is_moved = 3;
+}
+message UnlockResponse {
+    string error = 1;
+    string moved_to = 2;
+}
+message FindLockOwnerRequest {
+    string name = 1;
+    bool is_moved = 2;
+}
+message FindLockOwnerResponse {
+    string owner = 1;
+}
+message Lock {
+    string name = 1;
+    string renew_token = 2;
+    int64 expired_at_ns = 3;
+    string owner = 4;
+}
+message TransferLocksRequest {
+    repeated Lock locks = 1;
+}
+message TransferLocksResponse {
 }

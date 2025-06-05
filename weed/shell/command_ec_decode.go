@@ -4,11 +4,10 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"io"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"io"
-	"time"
 
 	"google.golang.org/grpc"
 
@@ -38,15 +37,17 @@ func (c *commandEcDecode) Help() string {
 `
 }
 
+func (c *commandEcDecode) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandEcDecode) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
-	encodeCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
-	volumeId := encodeCommand.Int("volumeId", 0, "the volume id")
-	collection := encodeCommand.String("collection", "", "the collection name")
-	forceChanges := encodeCommand.Bool("force", false, "force the encoding even if the cluster has less than recommended 4 nodes")
-	if err = encodeCommand.Parse(args); err != nil {
+	decodeCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
+	volumeId := decodeCommand.Int("volumeId", 0, "the volume id")
+	collection := decodeCommand.String("collection", "", "the collection name")
+	if err = decodeCommand.Parse(args); err != nil {
 		return nil
 	}
-	infoAboutSimulationMode(writer, *forceChanges, "-force")
 
 	if err = commandEnv.confirmIsLocked(args); err != nil {
 		return
@@ -58,17 +59,6 @@ func (c *commandEcDecode) Do(args []string, commandEnv *CommandEnv, writer io.Wr
 	topologyInfo, _, err := collectTopologyInfo(commandEnv, 0)
 	if err != nil {
 		return err
-	}
-
-	if !*forceChanges {
-		var nodeCount int
-		eachDataNode(topologyInfo, func(dc string, rack RackId, dn *master_pb.DataNodeInfo) {
-			nodeCount++
-		})
-		if nodeCount < erasure_coding.ParityShardsCount {
-			glog.V(0).Infof("skip erasure coding with %d nodes, less than recommended %d nodes", nodeCount, erasure_coding.ParityShardsCount)
-			return nil
-		}
 	}
 
 	// volumeId is provided
@@ -211,6 +201,16 @@ func collectEcShards(commandEnv *CommandEnv, nodeToEcIndexBits map[pb.ServerAddr
 				return fmt.Errorf("copy %d.%v %s => %s : %v\n", vid, needToCopyEcIndexBits.ShardIds(), loc, targetNodeLocation, copyErr)
 			}
 
+			fmt.Printf("mount %d.%v on %s\n", vid, needToCopyEcIndexBits.ShardIds(), targetNodeLocation)
+			_, mountErr := volumeServerClient.VolumeEcShardsMount(context.Background(), &volume_server_pb.VolumeEcShardsMountRequest{
+				VolumeId:   uint32(vid),
+				Collection: collection,
+				ShardIds:   needToCopyEcIndexBits.ToUint32Slice(),
+			})
+			if mountErr != nil {
+				return fmt.Errorf("mount %d.%v on %s : %v\n", vid, needToCopyEcIndexBits.ShardIds(), targetNodeLocation, mountErr)
+			}
+
 			return nil
 		})
 
@@ -240,29 +240,10 @@ func lookupVolumeIds(commandEnv *CommandEnv, volumeIds []string) (volumeIdLocati
 	return resp.VolumeIdLocations, nil
 }
 
-func collectTopologyInfo(commandEnv *CommandEnv, delayBeforeCollecting time.Duration) (topoInfo *master_pb.TopologyInfo, volumeSizeLimitMb uint64, err error) {
-
-	if delayBeforeCollecting > 0 {
-		time.Sleep(delayBeforeCollecting)
-	}
-
-	var resp *master_pb.VolumeListResponse
-	err = commandEnv.MasterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
-		resp, err = client.VolumeList(context.Background(), &master_pb.VolumeListRequest{})
-		return err
-	})
-	if err != nil {
-		return
-	}
-
-	return resp.TopologyInfo, resp.VolumeSizeLimitMb, nil
-
-}
-
 func collectEcShardIds(topoInfo *master_pb.TopologyInfo, selectedCollection string) (vids []needle.VolumeId) {
 
 	vidMap := make(map[uint32]bool)
-	eachDataNode(topoInfo, func(dc string, rack RackId, dn *master_pb.DataNodeInfo) {
+	eachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
 		if diskInfo, found := dn.DiskInfos[string(types.HardDriveType)]; found {
 			for _, v := range diskInfo.EcShardInfos {
 				if v.Collection == selectedCollection {
@@ -282,7 +263,7 @@ func collectEcShardIds(topoInfo *master_pb.TopologyInfo, selectedCollection stri
 func collectEcNodeShardBits(topoInfo *master_pb.TopologyInfo, vid needle.VolumeId) map[pb.ServerAddress]erasure_coding.ShardBits {
 
 	nodeToEcIndexBits := make(map[pb.ServerAddress]erasure_coding.ShardBits)
-	eachDataNode(topoInfo, func(dc string, rack RackId, dn *master_pb.DataNodeInfo) {
+	eachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
 		if diskInfo, found := dn.DiskInfos[string(types.HardDriveType)]; found {
 			for _, v := range diskInfo.EcShardInfos {
 				if v.Id == uint32(vid) {

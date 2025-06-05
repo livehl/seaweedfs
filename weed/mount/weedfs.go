@@ -2,6 +2,8 @@ package mount
 
 import (
 	"context"
+	"errors"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"math/rand"
 	"os"
 	"path"
@@ -38,12 +40,15 @@ type Option struct {
 	DiskType           types.DiskType
 	ChunkSizeLimit     int64
 	ConcurrentWriters  int
-	CacheDir           string
-	CacheSizeMB        int64
+	CacheDirForRead    string
+	CacheSizeMBForRead int64
+	CacheDirForWrite   string
+	CacheMetaTTlSec    int
 	DataCenter         string
 	Umask              os.FileMode
 	Quota              int64
 	DisableXAttr       bool
+	IsMacOs            bool
 
 	MountUid         uint32
 	MountGid         uint32
@@ -56,8 +61,8 @@ type Option struct {
 	Cipher             bool   // whether encrypt data on volume server
 	UidGidMapper       *meta_cache.UidGidMapper
 
-	uniqueCacheDir         string
-	uniqueCacheTempPageDir string
+	uniqueCacheDirForRead  string
+	uniqueCacheDirForWrite string
 }
 
 type WFS struct {
@@ -73,10 +78,12 @@ type WFS struct {
 	signature         int32
 	concurrentWriters *util.LimitedConcurrentExecutor
 	inodeToPath       *InodeToPath
-	fhmap             *FileHandleToInode
-	dhmap             *DirectoryHandleToInode
+	fhMap             *FileHandleToInode
+	dhMap             *DirectoryHandleToInode
 	fuseServer        *fuse.Server
 	IsOverQuota       bool
+	fhLockTable       *util.LockTable[FileHandleId]
+	FilerConf         *filer.FilerConf
 }
 
 func NewSeaweedFileSystem(option *Option) *WFS {
@@ -84,28 +91,50 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		RawFileSystem: fuse.NewDefaultRawFileSystem(),
 		option:        option,
 		signature:     util.RandomInt32(),
-		inodeToPath:   NewInodeToPath(util.FullPath(option.FilerMountRootPath)),
-		fhmap:         NewFileHandleToInode(),
-		dhmap:         NewDirectoryHandleToInode(),
+		inodeToPath:   NewInodeToPath(util.FullPath(option.FilerMountRootPath), option.CacheMetaTTlSec),
+		fhMap:         NewFileHandleToInode(),
+		dhMap:         NewDirectoryHandleToInode(),
+		fhLockTable:   util.NewLockTable[FileHandleId](),
 	}
 
 	wfs.option.filerIndex = int32(rand.Intn(len(option.FilerAddresses)))
 	wfs.option.setupUniqueCacheDirectory()
-	if option.CacheSizeMB > 0 {
-		wfs.chunkCache = chunk_cache.NewTieredChunkCache(256, option.getUniqueCacheDir(), option.CacheSizeMB, 1024*1024)
+	if option.CacheSizeMBForRead > 0 {
+		wfs.chunkCache = chunk_cache.NewTieredChunkCache(256, option.getUniqueCacheDirForRead(), option.CacheSizeMBForRead, 1024*1024)
 	}
 
-	wfs.metaCache = meta_cache.NewMetaCache(path.Join(option.getUniqueCacheDir(), "meta"), option.UidGidMapper,
+	wfs.metaCache = meta_cache.NewMetaCache(path.Join(option.getUniqueCacheDirForRead(), "meta"), option.UidGidMapper,
 		util.FullPath(option.FilerMountRootPath),
 		func(path util.FullPath) {
 			wfs.inodeToPath.MarkChildrenCached(path)
 		}, func(path util.FullPath) bool {
 			return wfs.inodeToPath.IsChildrenCached(path)
 		}, func(filePath util.FullPath, entry *filer_pb.Entry) {
+			// Find inode if it is not a deleted path
+			if inode, inodeFound := wfs.inodeToPath.GetInode(filePath); inodeFound {
+				// Find open file handle
+				if fh, fhFound := wfs.fhMap.FindFileHandle(inode); fhFound {
+					fhActiveLock := fh.wfs.fhLockTable.AcquireLock("invalidateFunc", fh.fh, util.ExclusiveLock)
+					defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
+
+					// Recreate dirty pages
+					fh.dirtyPages.Destroy()
+					fh.dirtyPages = newPageWriter(fh, wfs.option.ChunkSizeLimit)
+
+					// Update handle entry
+					newEntry, status := wfs.maybeLoadEntry(filePath)
+					if status == fuse.OK {
+						if fh.GetEntry().GetEntry() != newEntry {
+							fh.SetEntry(newEntry)
+						}
+					}
+				}
+			}
 		})
 	grace.OnInterrupt(func() {
 		wfs.metaCache.Shutdown()
-		os.RemoveAll(option.getUniqueCacheDir())
+		os.RemoveAll(option.getUniqueCacheDirForWrite())
+		os.RemoveAll(option.getUniqueCacheDirForRead())
 	})
 
 	if wfs.option.ConcurrentWriters > 0 {
@@ -114,10 +143,17 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 	return wfs
 }
 
-func (wfs *WFS) StartBackgroundTasks() {
+func (wfs *WFS) StartBackgroundTasks() error {
+	follower, err := wfs.subscribeFilerConfEvents()
+	if err != nil {
+		return err
+	}
+
 	startTime := time.Now()
-	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano())
+	go meta_cache.SubscribeMetaEvents(wfs.metaCache, wfs.signature, wfs, wfs.option.FilerMountRootPath, startTime.UnixNano(), follower)
 	go wfs.loopCheckQuota()
+
+	return nil
 }
 
 func (wfs *WFS) String() string {
@@ -134,7 +170,7 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 		return
 	}
 	var found bool
-	if fh, found = wfs.fhmap.FindFileHandle(inode); found {
+	if fh, found = wfs.fhMap.FindFileHandle(inode); found {
 		entry = fh.UpdateEntry(func(entry *filer_pb.Entry) {
 			if entry != nil && fh.entry.Attributes == nil {
 				entry.Attributes = &filer_pb.FuseAttributes{}
@@ -169,7 +205,7 @@ func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.St
 	// read from async meta cache
 	meta_cache.EnsureVisited(wfs.metaCache, wfs, util.FullPath(dir))
 	cachedEntry, cacheErr := wfs.metaCache.FindEntry(context.Background(), fullpath)
-	if cacheErr == filer_pb.ErrNotFound {
+	if errors.Is(cacheErr, filer_pb.ErrNotFound) {
 		return nil, fuse.ENOENT
 	}
 	return cachedEntry.ToProtoEntry(), fuse.OK
@@ -177,7 +213,7 @@ func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.St
 
 func (wfs *WFS) LookupFn() wdclient.LookupFileIdFunctionType {
 	if wfs.option.VolumeServerAccess == "filerProxy" {
-		return func(fileId string) (targetUrls []string, err error) {
+		return func(ctx context.Context, fileId string) (targetUrls []string, err error) {
 			return []string{"http://" + wfs.getCurrentFiler().ToHttpAddress() + "/?proxyChunkId=" + fileId}, nil
 		}
 	}
@@ -189,17 +225,24 @@ func (wfs *WFS) getCurrentFiler() pb.ServerAddress {
 	return wfs.option.FilerAddresses[i]
 }
 
+func (wfs *WFS) ClearCacheDir() {
+	wfs.metaCache.Shutdown()
+	os.RemoveAll(wfs.option.getUniqueCacheDirForWrite())
+	os.RemoveAll(wfs.option.getUniqueCacheDirForRead())
+}
+
 func (option *Option) setupUniqueCacheDirectory() {
-	cacheUniqueId := util.Md5String([]byte(string(option.FilerAddresses[0]) + option.FilerMountRootPath + util.Version()))[0:8]
-	option.uniqueCacheDir = path.Join(option.CacheDir, cacheUniqueId)
-	option.uniqueCacheTempPageDir = filepath.Join(option.uniqueCacheDir, "swap")
-	os.MkdirAll(option.uniqueCacheTempPageDir, os.FileMode(0777)&^option.Umask)
+	cacheUniqueId := util.Md5String([]byte(option.MountDirectory + string(option.FilerAddresses[0]) + option.FilerMountRootPath + version.Version()))[0:8]
+	option.uniqueCacheDirForRead = path.Join(option.CacheDirForRead, cacheUniqueId)
+	os.MkdirAll(option.uniqueCacheDirForRead, os.FileMode(0777)&^option.Umask)
+	option.uniqueCacheDirForWrite = filepath.Join(path.Join(option.CacheDirForWrite, cacheUniqueId), "swap")
+	os.MkdirAll(option.uniqueCacheDirForWrite, os.FileMode(0777)&^option.Umask)
 }
 
-func (option *Option) getTempFilePageDir() string {
-	return option.uniqueCacheTempPageDir
+func (option *Option) getUniqueCacheDirForWrite() string {
+	return option.uniqueCacheDirForWrite
 }
 
-func (option *Option) getUniqueCacheDir() string {
-	return option.uniqueCacheDir
+func (option *Option) getUniqueCacheDirForRead() string {
+	return option.uniqueCacheDirForRead
 }

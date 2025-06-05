@@ -3,19 +3,14 @@ package needle
 import (
 	"bytes"
 	"fmt"
+	"math"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
 	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"math"
-	"sync"
+	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
 )
-
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
-}
 
 func (n *Needle) prepareWriteBuffer(version Version, writeBytes *bytes.Buffer) (Size, int64, error) {
 	writeBytes.Reset()
@@ -124,21 +119,24 @@ func (n *Needle) Append(w backend.BackendStorageFile, version Version) (offset u
 		}(w, end)
 		offset = uint64(end)
 	} else {
-		err = fmt.Errorf("Cannot Read Current Volume Position: %v", e)
+		err = fmt.Errorf("Cannot Read Current Volume Position: %w", e)
 		return
 	}
-	if offset >= MaxPossibleVolumeSize && n.Size.IsValid() {
+	if offset >= MaxPossibleVolumeSize && len(n.Data) != 0 {
 		err = fmt.Errorf("Volume Size %d Exceeded %d", offset, MaxPossibleVolumeSize)
 		return
 	}
 
-	bytesBuffer := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(bytesBuffer)
+	bytesBuffer := buffer_pool.SyncPoolGetBuffer()
+	defer buffer_pool.SyncPoolPutBuffer(bytesBuffer)
 
 	size, actualSize, err = n.prepareWriteBuffer(version, bytesBuffer)
 
 	if err == nil {
 		_, err = w.WriteAt(bytesBuffer.Bytes(), int64(offset))
+		if err != nil {
+			err = fmt.Errorf("failed to write %d bytes to %s at offset %d: %w", actualSize, w.Name(), offset, err)
+		}
 	}
 
 	return offset, size, actualSize, err

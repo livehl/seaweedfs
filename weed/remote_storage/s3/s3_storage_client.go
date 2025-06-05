@@ -2,6 +2,10 @@ package s3
 
 import (
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
+	"io"
+	"reflect"
+
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/request"
@@ -15,8 +19,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/remote_pb"
 	"github.com/seaweedfs/seaweedfs/weed/remote_storage"
 	"github.com/seaweedfs/seaweedfs/weed/util"
-	"io"
-	"reflect"
 )
 
 func init() {
@@ -52,7 +54,7 @@ func (s s3RemoteStorageMaker) Make(conf *remote_pb.RemoteConf) (remote_storage.R
 		sess.Handlers.Sign.PushBackNamed(v4.SignRequestHandler)
 	}
 	sess.Handlers.Build.PushBack(func(r *request.Request) {
-		r.HTTPRequest.Header.Set("User-Agent", "SeaweedFS/"+util.VERSION_NUMBER)
+		r.HTTPRequest.Header.Set("User-Agent", "SeaweedFS/"+version.VERSION_NUMBER)
 	})
 	sess.Handlers.Build.PushFront(skipSha256PayloadSigning)
 	client.conn = s3.New(sess)
@@ -155,18 +157,21 @@ func (s *s3RemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocation, 
 	// Create an uploader with the session and custom options
 	uploader := s3manager.NewUploaderWithClient(s.conn, func(u *s3manager.Uploader) {
 		u.PartSize = partSize
-		u.Concurrency = 8
+		u.Concurrency = 1
 	})
 
 	// process tagging
 	tags := ""
-	if s.supportTagging {
+	var awsTags *string
+	// openstack swift doesn't support s3 object tagging
+	if s.conf.S3SupportTagging {
 		for k, v := range entry.Extended {
 			if len(tags) > 0 {
 				tags = tags + "&"
 			}
 			tags = tags + k + "=" + string(v)
 		}
+		awsTags = aws.String(tags)
 	}
 
 	// Upload the file to S3.
@@ -174,7 +179,7 @@ func (s *s3RemoteStorageClient) WriteFile(loc *remote_pb.RemoteStorageLocation, 
 		Bucket:       aws.String(loc.Bucket),
 		Key:          aws.String(loc.Path[1:]),
 		Body:         reader,
-		Tagging:      aws.String(tags),
+		Tagging:      awsTags,
 		StorageClass: aws.String(s.conf.S3StorageClass),
 	})
 

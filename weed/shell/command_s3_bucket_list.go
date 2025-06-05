@@ -27,6 +27,10 @@ func (c *commandS3BucketList) Help() string {
 `
 }
 
+func (c *commandS3BucketList) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandS3BucketList) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	bucketCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -53,17 +57,17 @@ func (c *commandS3BucketList) Do(args []string, commandEnv *CommandEnv, writer i
 		return fmt.Errorf("read buckets: %v", err)
 	}
 
-	err = filer_pb.List(commandEnv, filerBucketsPath, "", func(entry *filer_pb.Entry, isLast bool) error {
+	err = filer_pb.List(context.Background(), commandEnv, filerBucketsPath, "", func(entry *filer_pb.Entry, isLast bool) error {
 		if !entry.IsDirectory {
 			return nil
 		}
-		collection := entry.Name
+		collection := getCollectionName(commandEnv, entry.Name)
 		var collectionSize, fileCount float64
 		if collectionInfo, found := collectionInfos[collection]; found {
 			collectionSize = collectionInfo.Size
 			fileCount = collectionInfo.FileCount - collectionInfo.DeleteCount
 		}
-		fmt.Fprintf(writer, "  %s\tsize:%.0f\tfile:%.0f", entry.Name, collectionSize, fileCount)
+		fmt.Fprintf(writer, "  %s\tsize:%.0f\tchunk:%.0f", entry.Name, collectionSize, fileCount)
 		if entry.Quota > 0 {
 			fmt.Fprintf(writer, "\tquota:%d\tusage:%.2f%%", entry.Quota, float64(collectionSize)*100/float64(entry.Quota))
 		}

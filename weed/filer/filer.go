@@ -3,13 +3,18 @@ package filer
 import (
 	"context"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/cluster"
-	"github.com/seaweedfs/seaweedfs/weed/pb"
-	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"os"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
+
+	"github.com/seaweedfs/seaweedfs/weed/cluster/lock_manager"
+
+	"github.com/seaweedfs/seaweedfs/weed/cluster"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 
 	"google.golang.org/grpc"
 
@@ -47,10 +52,11 @@ type Filer struct {
 	Signature           int32
 	FilerConf           *FilerConf
 	RemoteStorage       *FilerRemoteStorage
+	Dlm                 *lock_manager.DistributedLockManager
+	MaxFilenameLength   uint32
 }
 
-func NewFiler(masters map[string]pb.ServerAddress, grpcDialOption grpc.DialOption, filerHost pb.ServerAddress,
-	filerGroup string, collection string, replication string, dataCenter string, notifyFn func()) *Filer {
+func NewFiler(masters pb.ServerDiscovery, grpcDialOption grpc.DialOption, filerHost pb.ServerAddress, filerGroup string, collection string, replication string, dataCenter string, maxFilenameLength uint32, notifyFn func()) *Filer {
 	f := &Filer{
 		MasterClient:        wdclient.NewMasterClient(grpcDialOption, filerGroup, cluster.FilerType, filerHost, dataCenter, "", masters),
 		fileIdDeletionQueue: util.NewUnboundedQueue(),
@@ -58,12 +64,14 @@ func NewFiler(masters map[string]pb.ServerAddress, grpcDialOption grpc.DialOptio
 		FilerConf:           NewFilerConf(),
 		RemoteStorage:       NewFilerRemoteStorage(),
 		UniqueFilerId:       util.RandomInt32(),
+		Dlm:                 lock_manager.NewDistributedLockManager(filerHost),
+		MaxFilenameLength:   maxFilenameLength,
 	}
 	if f.UniqueFilerId < 0 {
 		f.UniqueFilerId = -f.UniqueFilerId
 	}
 
-	f.LocalMetaLogBuffer = log_buffer.NewLogBuffer("local", LogFlushInterval, f.logFlushFunc, notifyFn)
+	f.LocalMetaLogBuffer = log_buffer.NewLogBuffer("local", LogFlushInterval, f.logFlushFunc, nil, notifyFn)
 	f.metaLogCollection = collection
 	f.metaLogReplication = replication
 
@@ -72,7 +80,7 @@ func NewFiler(masters map[string]pb.ServerAddress, grpcDialOption grpc.DialOptio
 	return f
 }
 
-func (f *Filer) MaybeBootstrapFromPeers(self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, snapshotTime time.Time) (err error) {
+func (f *Filer) MaybeBootstrapFromOnePeer(self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, snapshotTime time.Time) (err error) {
 	if len(existingNodes) == 0 {
 		return
 	}
@@ -85,18 +93,39 @@ func (f *Filer) MaybeBootstrapFromPeers(self pb.ServerAddress, existingNodes []*
 	}
 
 	glog.V(0).Infof("bootstrap from %v clientId:%d", earliestNode.Address, f.UniqueFilerId)
-	f.UniqueFilerEpoch++
-	err = pb.FollowMetadata(pb.ServerAddress(earliestNode.Address), f.GrpcDialOption, "bootstrap", f.UniqueFilerId, f.UniqueFilerEpoch, "/", nil,
-		0, snapshotTime.UnixNano(), f.Signature, func(resp *filer_pb.SubscribeMetadataResponse) error {
-			return Replay(f.Store, resp)
-		}, pb.FatalOnError)
-	return
+
+	return pb.WithFilerClient(false, f.UniqueFilerId, pb.ServerAddress(earliestNode.Address), f.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		return filer_pb.StreamBfs(client, "/", snapshotTime.UnixNano(), func(parentPath util.FullPath, entry *filer_pb.Entry) error {
+			return f.Store.InsertEntry(context.Background(), FromPbEntry(string(parentPath), entry))
+		})
+	})
+
 }
 
 func (f *Filer) AggregateFromPeers(self pb.ServerAddress, existingNodes []*master_pb.ClusterNodeUpdate, startFrom time.Time) {
 
+	var snapshot []pb.ServerAddress
+	for _, node := range existingNodes {
+		address := pb.ServerAddress(node.Address)
+		snapshot = append(snapshot, address)
+	}
+	f.Dlm.LockRing.SetSnapshot(snapshot)
+	glog.V(0).Infof("%s aggregate from peers %+v", self, snapshot)
+
 	f.MetaAggregator = NewMetaAggregator(f, self, f.GrpcDialOption)
-	f.MasterClient.SetOnPeerUpdateFn(f.MetaAggregator.OnPeerUpdate)
+	f.MasterClient.SetOnPeerUpdateFn(func(update *master_pb.ClusterNodeUpdate, startFrom time.Time) {
+		if update.NodeType != cluster.FilerType {
+			return
+		}
+		address := pb.ServerAddress(update.Address)
+
+		if update.IsAdd {
+			f.Dlm.LockRing.AddServer(address)
+		} else {
+			f.Dlm.LockRing.RemoveServer(address)
+		}
+		f.MetaAggregator.OnPeerUpdate(update, startFrom)
+	})
 
 	for _, peerUpdate := range existingNodes {
 		f.MetaAggregator.OnPeerUpdate(peerUpdate, startFrom)
@@ -104,8 +133,8 @@ func (f *Filer) AggregateFromPeers(self pb.ServerAddress, existingNodes []*maste
 
 }
 
-func (f *Filer) ListExistingPeerUpdates() (existingNodes []*master_pb.ClusterNodeUpdate) {
-	return cluster.ListExistingPeerUpdates(f.GetMaster(), f.GrpcDialOption, f.MasterClient.FilerGroup, cluster.FilerType)
+func (f *Filer) ListExistingPeerUpdates(ctx context.Context) (existingNodes []*master_pb.ClusterNodeUpdate) {
+	return cluster.ListExistingPeerUpdates(f.GetMaster(ctx), f.GrpcDialOption, f.MasterClient.FilerGroup, cluster.FilerType)
 }
 
 func (f *Filer) SetStore(store FilerStore) (isFresh bool) {
@@ -138,12 +167,12 @@ func (f *Filer) GetStore() (store FilerStore) {
 	return f.Store
 }
 
-func (fs *Filer) GetMaster() pb.ServerAddress {
-	return fs.MasterClient.GetMaster()
+func (fs *Filer) GetMaster(ctx context.Context) pb.ServerAddress {
+	return fs.MasterClient.GetMaster(ctx)
 }
 
-func (fs *Filer) KeepMasterClientConnected() {
-	fs.MasterClient.KeepConnectedToMaster()
+func (fs *Filer) KeepMasterClientConnected(ctx context.Context) {
+	fs.MasterClient.KeepConnectedToMaster(ctx)
 }
 
 func (f *Filer) BeginTransaction(ctx context.Context) (context.Context, error) {
@@ -158,10 +187,18 @@ func (f *Filer) RollbackTransaction(ctx context.Context) error {
 	return f.Store.RollbackTransaction(ctx)
 }
 
-func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, o_excl bool, isFromOtherCluster bool, signatures []int32, skipCreateParentDir bool) error {
+func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, o_excl bool, isFromOtherCluster bool, signatures []int32, skipCreateParentDir bool, maxFilenameLength uint32) error {
 
 	if string(entry.FullPath) == "/" {
 		return nil
+	}
+
+	if entry.FullPath.IsLongerFileName(maxFilenameLength) {
+		return fmt.Errorf("entry name too long")
+	}
+
+	if entry.IsDirectory() {
+		entry.Attr.TtlSec = 0
 	}
 
 	oldEntry, _ := f.FindEntry(ctx, entry.FullPath)
@@ -202,7 +239,7 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, o_excl bool, isFr
 
 	f.NotifyUpdateEvent(ctx, oldEntry, entry, true, isFromOtherCluster, signatures)
 
-	f.deleteChunksIfNotNew(oldEntry, entry)
+	f.deleteChunksIfNotNew(ctx, oldEntry, entry)
 
 	glog.V(4).Infof("CreateEntry %s: created", entry.FullPath)
 
@@ -216,7 +253,7 @@ func (f *Filer) ensureParentDirectoryEntry(ctx context.Context, entry *Entry, di
 	}
 
 	dirPath := "/" + util.Join(dirParts[:level]...)
-	// fmt.Printf("%d directory: %+v\n", i, dirPath)
+	// fmt.Printf("%d dirPath: %+v\n", level, dirPath)
 
 	// check the store directly
 	glog.V(4).Infof("find uncached directory: %s", dirPath)
@@ -224,6 +261,14 @@ func (f *Filer) ensureParentDirectoryEntry(ctx context.Context, entry *Entry, di
 
 	// no such existing directory
 	if dirEntry == nil {
+
+		// fmt.Printf("dirParts: %v %v %v\n", dirParts[0], dirParts[1], dirParts[2])
+		// dirParts[0] == "" and dirParts[1] == "buckets"
+		if len(dirParts) >= 3 && dirParts[1] == "buckets" {
+			if err := s3bucket.VerifyS3BucketName(dirParts[2]); err != nil {
+				return fmt.Errorf("invalid bucket name %s: %v", dirParts[2], err)
+			}
+		}
 
 		// ensure parent directory
 		if err = f.ensureParentDirectoryEntry(ctx, entry, dirParts, level-1, isFromOtherCluster); err != nil {
@@ -249,12 +294,14 @@ func (f *Filer) ensureParentDirectoryEntry(ctx context.Context, entry *Entry, di
 		glog.V(2).Infof("create directory: %s %v", dirPath, dirEntry.Mode)
 		mkdirErr := f.Store.InsertEntry(ctx, dirEntry)
 		if mkdirErr != nil {
-			if _, err := f.FindEntry(ctx, util.FullPath(dirPath)); err == filer_pb.ErrNotFound {
+			if fEntry, err := f.FindEntry(ctx, util.FullPath(dirPath)); err == filer_pb.ErrNotFound || fEntry == nil {
 				glog.V(3).Infof("mkdir %s: %v", dirPath, mkdirErr)
 				return fmt.Errorf("mkdir %s: %v", dirPath, mkdirErr)
 			}
 		} else {
-			f.NotifyUpdateEvent(ctx, nil, dirEntry, false, isFromOtherCluster, nil)
+			if !strings.HasPrefix("/"+util.Join(dirParts[:]...), SystemLogDir) {
+				f.NotifyUpdateEvent(ctx, nil, dirEntry, false, isFromOtherCluster, nil)
+			}
 		}
 
 	} else if !dirEntry.IsDirectory() {
@@ -332,6 +379,6 @@ func (f *Filer) doListDirectoryEntries(ctx context.Context, p util.FullPath, sta
 }
 
 func (f *Filer) Shutdown() {
-	f.LocalMetaLogBuffer.Shutdown()
+	f.LocalMetaLogBuffer.ShutdownLogBuffer()
 	f.Store.Shutdown()
 }

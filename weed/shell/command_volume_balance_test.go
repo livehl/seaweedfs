@@ -1,9 +1,11 @@
 package shell
 
 import (
+	"fmt"
+	"testing"
+
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/stretchr/testify/assert"
-	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/super_block"
@@ -149,6 +151,82 @@ func TestIsGoodMove(t *testing.T) {
 			targetLocation: location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
 			expected:       true,
 		},
+
+		{
+			name:        "test 011 switch which rack has more replicas",
+			replication: "011",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+				},
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+				{
+					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
+				},
+			},
+			sourceLocation: location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+			targetLocation: location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn4"}},
+			expected:       true,
+		},
+
+		{
+			name:        "test 011 move the lonely replica to another racks",
+			replication: "011",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+				},
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+				{
+					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
+				},
+			},
+			sourceLocation: location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
+			targetLocation: location{"dc1", "r3", &master_pb.DataNodeInfo{Id: "dn4"}},
+			expected:       true,
+		},
+
+		{
+			name:        "test 011 move to wrong racks",
+			replication: "011",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+				},
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+				{
+					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
+				},
+			},
+			sourceLocation: location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+			targetLocation: location{"dc1", "r3", &master_pb.DataNodeInfo{Id: "dn4"}},
+			expected:       false,
+		},
+
+		{
+			name:        "test 011 move all to the same rack",
+			replication: "011",
+			replicas: []*VolumeReplica{
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn1"}},
+				},
+				{
+					location: &location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn2"}},
+				},
+				{
+					location: &location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
+				},
+			},
+			sourceLocation: location{"dc1", "r2", &master_pb.DataNodeInfo{Id: "dn3"}},
+			targetLocation: location{"dc1", "r1", &master_pb.DataNodeInfo{Id: "dn4"}},
+			expected:       false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -174,11 +252,11 @@ func TestIsGoodMove(t *testing.T) {
 
 func TestBalance(t *testing.T) {
 	topologyInfo := parseOutput(topoData)
-	volumeServers := collectVolumeServersByDc(topologyInfo, "")
+	volumeServers := collectVolumeServersByDcRackNode(topologyInfo, "", "", "")
 	volumeReplicas, _ := collectVolumeReplicaLocations(topologyInfo)
 	diskTypes := collectVolumeDiskTypes(topologyInfo)
-
-	if err := balanceVolumeServers(nil, diskTypes, volumeReplicas, volumeServers, 30*1024*1024*1024, "ALL_COLLECTIONS", false); err != nil {
+	c := &commandVolumeBalance{}
+	if err := c.balanceVolumeServers(diskTypes, volumeReplicas, volumeServers, "ALL_COLLECTIONS"); err != nil {
 		t.Errorf("balance: %v", err)
 	}
 
@@ -187,10 +265,25 @@ func TestBalance(t *testing.T) {
 func TestVolumeSelection(t *testing.T) {
 	topologyInfo := parseOutput(topoData)
 
-	vids, err := collectVolumeIdsForTierChange(nil, topologyInfo, 1000, types.ToDiskType("hdd"), "", 20.0, 0)
+	vids, err := collectVolumeIdsForTierChange(topologyInfo, 1000, types.ToDiskType(types.HddType), "", 20.0, 0)
 	if err != nil {
 		t.Errorf("collectVolumeIdsForTierChange: %v", err)
 	}
 	assert.Equal(t, 378, len(vids))
+
+}
+
+func TestDeleteEmptySelection(t *testing.T) {
+	topologyInfo := parseOutput(topoData)
+
+	eachDataNode(topologyInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
+		for _, diskInfo := range dn.DiskInfos {
+			for _, v := range diskInfo.VolumeInfos {
+				if v.Size <= super_block.SuperBlockSize && v.ModifiedAtSecond > 0 {
+					fmt.Printf("empty volume %d from %s\n", v.Id, dn.Id)
+				}
+			}
+		}
+	})
 
 }

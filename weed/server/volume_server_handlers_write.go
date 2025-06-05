@@ -1,7 +1,6 @@
 package weed_server
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,9 +12,11 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/topology"
+	"github.com/seaweedfs/seaweedfs/weed/util/buffer_pool"
 )
 
 func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	if e := r.ParseForm(); e != nil {
 		glog.V(0).Infoln("form parse error:", e)
 		writeJsonError(w, r, http.StatusBadRequest, e)
@@ -35,8 +36,8 @@ func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bytesBuffer := bufPool.Get().(*bytes.Buffer)
-	defer bufPool.Put(bytesBuffer)
+	bytesBuffer := buffer_pool.SyncPoolGetBuffer()
+	defer buffer_pool.SyncPoolPutBuffer(bytesBuffer)
 
 	reqNeedle, originalSize, contentMd5, ne := needle.CreateNeedleFromRequest(r, vs.FixJpgOrientation, vs.fileSizeLimitBytes, bytesBuffer)
 	if ne != nil {
@@ -45,14 +46,15 @@ func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ret := operation.UploadResult{}
-	isUnchanged, writeError := topology.ReplicatedWrite(vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, reqNeedle, r)
+	isUnchanged, writeError := topology.ReplicatedWrite(ctx, vs.GetMaster, vs.grpcDialOption, vs.store, volumeId, reqNeedle, r, contentMd5)
 	if writeError != nil {
 		writeJsonError(w, r, http.StatusInternalServerError, writeError)
+		return
 	}
 
 	// http 204 status code does not allow body
 	if writeError == nil && isUnchanged {
-		setEtag(w, reqNeedle.Etag())
+		SetEtag(w, reqNeedle.Etag())
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -64,7 +66,7 @@ func (vs *VolumeServer) PostHandler(w http.ResponseWriter, r *http.Request) {
 	ret.Size = uint32(originalSize)
 	ret.ETag = reqNeedle.Etag()
 	ret.Mime = string(reqNeedle.Mime)
-	setEtag(w, ret.ETag)
+	SetEtag(w, ret.ETag)
 	w.Header().Set("Content-MD5", contentMd5)
 	writeJsonQuiet(w, r, httpStatus, ret)
 }
@@ -146,7 +148,7 @@ func writeDeleteResult(err error, count int64, w http.ResponseWriter, r *http.Re
 	}
 }
 
-func setEtag(w http.ResponseWriter, etag string) {
+func SetEtag(w http.ResponseWriter, etag string) {
 	if etag != "" {
 		if strings.HasPrefix(etag, "\"") {
 			w.Header().Set("ETag", etag)

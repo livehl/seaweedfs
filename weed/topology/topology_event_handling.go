@@ -1,18 +1,19 @@
 package topology
 
 import (
+	"math/rand/v2"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"google.golang.org/grpc"
-	"math/rand"
-	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 )
 
-func (t *Topology) StartRefreshWritableVolumes(grpcDialOption grpc.DialOption, garbageThreshold float64, growThreshold float64, preallocate int64) {
+func (t *Topology) StartRefreshWritableVolumes(grpcDialOption grpc.DialOption, garbageThreshold float64, concurrentVacuumLimitPerVolumeServer int, growThreshold float64, preallocate int64) {
 	go func() {
 		for {
 			if t.IsLeader() {
@@ -25,7 +26,9 @@ func (t *Topology) StartRefreshWritableVolumes(grpcDialOption grpc.DialOption, g
 	go func(garbageThreshold float64) {
 		for {
 			if t.IsLeader() {
-				t.Vacuum(grpcDialOption, garbageThreshold, 0, "", preallocate)
+				if !t.isDisableVacuum {
+					t.Vacuum(grpcDialOption, garbageThreshold, concurrentVacuumLimitPerVolumeServer, 0, "", preallocate, true)
+				}
 			} else {
 				stats.MasterReplicaPlacementMismatch.Reset()
 			}
@@ -62,10 +65,9 @@ func (t *Topology) SetVolumeCapacityFull(volumeInfo storage.VolumeInfo) bool {
 		if !volumeInfo.ReadOnly {
 
 			disk := dn.getOrCreateDisk(volumeInfo.DiskType)
-			deltaDiskUsages := newDiskUsages()
-			deltaDiskUsage := deltaDiskUsages.getOrCreateDisk(types.ToDiskType(volumeInfo.DiskType))
-			deltaDiskUsage.activeVolumeCount = -1
-			disk.UpAdjustDiskUsageDelta(deltaDiskUsages)
+			disk.UpAdjustDiskUsageDelta(types.ToDiskType(volumeInfo.DiskType), &DiskUsageCounts{
+				activeVolumeCount: -1,
+			})
 
 		}
 	}
@@ -79,6 +81,7 @@ func (t *Topology) SetVolumeCrowded(volumeInfo storage.VolumeInfo) {
 }
 
 func (t *Topology) UnRegisterDataNode(dn *DataNode) {
+	dn.IsTerminating = true
 	for _, v := range dn.GetVolumes() {
 		glog.V(0).Infoln("Removing Volume", v.Id, "from the dead volume server", dn.Id())
 		diskType := types.ToDiskType(v.DiskType)
@@ -86,8 +89,15 @@ func (t *Topology) UnRegisterDataNode(dn *DataNode) {
 		vl.SetVolumeUnavailable(dn, v.Id)
 	}
 
+	// unregister ec shards when volume server disconnected
+	for _, s := range dn.GetEcShards() {
+		t.UnRegisterEcShards(s, dn)
+	}
+
 	negativeUsages := dn.GetDiskUsages().negative()
-	dn.UpAdjustDiskUsageDelta(negativeUsages)
+	for dt, du := range negativeUsages.usages {
+		dn.UpAdjustDiskUsageDelta(dt, du)
+	}
 	dn.DeltaUpdateVolumes([]storage.VolumeInfo{}, dn.GetVolumes())
 	dn.DeltaUpdateEcShards([]*erasure_coding.EcVolumeInfo{}, dn.GetEcShards())
 	if dn.Parent() != nil {

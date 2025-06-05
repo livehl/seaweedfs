@@ -32,7 +32,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 
 		glog.V(0).Infof("volume %d already exists. deleted before copying...", req.VolumeId)
 
-		err := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId))
+		err := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId), false)
 		if err != nil {
 			return fmt.Errorf("failed to delete existing volume %d: %v", req.VolumeId, err)
 		}
@@ -48,6 +48,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 	//   confirm size and timestamp
 	var volFileInfoResp *volume_server_pb.ReadVolumeFileStatusResponse
 	var dataBaseFileName, indexBaseFileName, idxFileName, datFileName string
+	var hasRemoteDatFile bool
 	err := operation.WithVolumeServerClient(true, pb.ServerAddress(req.SourceDataNode), vs.grpcDialOption, func(client volume_server_pb.VolumeServerClient) error {
 		var err error
 		volFileInfoResp, err = client.ReadVolumeFileStatus(context.Background(),
@@ -62,13 +63,16 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		if req.DiskType != "" {
 			diskType = req.DiskType
 		}
-		location := vs.store.FindFreeLocation(types.ToDiskType(diskType))
+		location := vs.store.FindFreeLocation(func(location *storage.DiskLocation) bool {
+			return location.DiskType == types.ToDiskType(diskType)
+		})
 		if location == nil {
 			return fmt.Errorf("no space left for disk type %s", types.ToDiskType(diskType).ReadableString())
 		}
 
 		dataBaseFileName = storage.VolumeFileName(location.Directory, volFileInfoResp.Collection, int(req.VolumeId))
 		indexBaseFileName = storage.VolumeFileName(location.IdxDirectory, volFileInfoResp.Collection, int(req.VolumeId))
+		hasRemoteDatFile = volFileInfoResp.VolumeInfo != nil && len(volFileInfoResp.VolumeInfo.Files) > 0
 
 		util.WriteFile(dataBaseFileName+".note", []byte(fmt.Sprintf("copying from %s", req.SourceDataNode)), 0755)
 
@@ -82,20 +86,20 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		}()
 
 		var preallocateSize int64
-		if grpcErr := pb.WithMasterClient(false, vs.GetMaster(), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+		if grpcErr := pb.WithMasterClient(false, vs.GetMaster(context.Background()), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 			resp, err := client.GetMasterConfiguration(context.Background(), &master_pb.GetMasterConfigurationRequest{})
 			if err != nil {
-				return fmt.Errorf("get master %s configuration: %v", vs.GetMaster(), err)
+				return fmt.Errorf("get master %s configuration: %v", vs.GetMaster(context.Background()), err)
 			}
 			if resp.VolumePreallocate {
 				preallocateSize = int64(resp.VolumeSizeLimitMB) * (1 << 20)
 			}
 			return nil
 		}); grpcErr != nil {
-			glog.V(0).Infof("connect to %s: %v", vs.GetMaster(), grpcErr)
+			glog.V(0).Infof("connect to %s: %v", vs.GetMaster(context.Background()), grpcErr)
 		}
 
-		if preallocateSize > 0 {
+		if preallocateSize > 0 && !hasRemoteDatFile {
 			volumeFile := dataBaseFileName + ".dat"
 			_, err := backend.CreateVolumeFile(volumeFile, preallocateSize, 0)
 			if err != nil {
@@ -116,23 +120,26 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 			ioBytePerSecond = req.IoBytePerSecond
 		}
 		throttler := util.NewWriteThrottler(ioBytePerSecond)
-		if modifiedTsNs, err = vs.doCopyFileWithThrottler(client, false, req.Collection, req.VolumeId, volFileInfoResp.CompactionRevision, volFileInfoResp.DatFileSize, dataBaseFileName, ".dat", false, true, func(processed int64) bool {
-			if processed > nextReportTarget {
-				copyResponse.ProcessedBytes = processed
-				if sendErr = stream.Send(copyResponse); sendErr != nil {
-					return false
+
+		if !hasRemoteDatFile {
+			if modifiedTsNs, err = vs.doCopyFileWithThrottler(client, false, req.Collection, req.VolumeId, volFileInfoResp.CompactionRevision, volFileInfoResp.DatFileSize, dataBaseFileName, ".dat", false, true, func(processed int64) bool {
+				if processed > nextReportTarget {
+					copyResponse.ProcessedBytes = processed
+					if sendErr = stream.Send(copyResponse); sendErr != nil {
+						return false
+					}
+					nextReportTarget = processed + reportInterval
 				}
-				nextReportTarget = processed + reportInterval
+				return true
+			}, throttler); err != nil {
+				return err
 			}
-			return true
-		}, throttler); err != nil {
-			return err
-		}
-		if sendErr != nil {
-			return sendErr
-		}
-		if modifiedTsNs > 0 {
-			os.Chtimes(dataBaseFileName+".dat", time.Unix(0, modifiedTsNs), time.Unix(0, modifiedTsNs))
+			if sendErr != nil {
+				return sendErr
+			}
+			if modifiedTsNs > 0 {
+				os.Chtimes(dataBaseFileName+".dat", time.Unix(0, modifiedTsNs), time.Unix(0, modifiedTsNs))
+			}
 		}
 
 		if modifiedTsNs, err = vs.doCopyFileWithThrottler(client, false, req.Collection, req.VolumeId, volFileInfoResp.CompactionRevision, volFileInfoResp.IdxFileSize, indexBaseFileName, ".idx", false, false, nil, throttler); err != nil {
@@ -142,7 +149,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 			os.Chtimes(indexBaseFileName+".idx", time.Unix(0, modifiedTsNs), time.Unix(0, modifiedTsNs))
 		}
 
-		if modifiedTsNs, err = vs.doCopyFileWithThrottler(client, false, req.Collection, req.VolumeId, volFileInfoResp.CompactionRevision, volFileInfoResp.DatFileSize, dataBaseFileName, ".vif", false, true, nil, throttler); err != nil {
+		if modifiedTsNs, err = vs.doCopyFileWithThrottler(client, false, req.Collection, req.VolumeId, volFileInfoResp.CompactionRevision, 1024*1024, dataBaseFileName, ".vif", false, true, nil, throttler); err != nil {
 			return err
 		}
 		if modifiedTsNs > 0 {
@@ -172,7 +179,7 @@ func (vs *VolumeServer) VolumeCopy(req *volume_server_pb.VolumeCopyRequest, stre
 		}
 	}()
 
-	if err = checkCopyFiles(volFileInfoResp, idxFileName, datFileName); err != nil { // added by panyc16
+	if err = checkCopyFiles(volFileInfoResp, hasRemoteDatFile, idxFileName, datFileName); err != nil { // added by panyc16
 		return err
 	}
 
@@ -221,10 +228,10 @@ func (vs *VolumeServer) doCopyFileWithThrottler(client volume_server_pb.VolumeSe
 
 /*
 *
-only check the the differ of the file size
+only check the differ of the file size
 todo: maybe should check the received count and deleted count of the volume
 */
-func checkCopyFiles(originFileInf *volume_server_pb.ReadVolumeFileStatusResponse, idxFileName, datFileName string) error {
+func checkCopyFiles(originFileInf *volume_server_pb.ReadVolumeFileStatusResponse, hasRemoteDatFile bool, idxFileName, datFileName string) error {
 	stat, err := os.Stat(idxFileName)
 	if err != nil {
 		return fmt.Errorf("stat idx file %s failed: %v", idxFileName, err)
@@ -232,6 +239,10 @@ func checkCopyFiles(originFileInf *volume_server_pb.ReadVolumeFileStatusResponse
 	if originFileInf.IdxFileSize != uint64(stat.Size()) {
 		return fmt.Errorf("idx file %s size [%v] is not same as origin file size [%v]",
 			idxFileName, stat.Size(), originFileInf.IdxFileSize)
+	}
+
+	if hasRemoteDatFile {
+		return nil
 	}
 
 	stat, err = os.Stat(datFileName)
@@ -298,6 +309,7 @@ func (vs *VolumeServer) ReadVolumeFileStatus(ctx context.Context, req *volume_se
 	resp.CompactionRevision = uint32(v.CompactionRevision)
 	resp.Collection = v.Collection
 	resp.DiskType = string(v.DiskType())
+	resp.VolumeInfo = v.GetVolumeInfo()
 	return resp, nil
 }
 

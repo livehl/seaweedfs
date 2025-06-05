@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -13,8 +14,10 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+const cutoffTimeNewEmptyDir = 3
+
 func (entry *Entry) IsInRemoteOnly() bool {
-	return len(entry.Chunks) == 0 && entry.RemoteEntry != nil && entry.RemoteEntry.RemoteSize > 0
+	return len(entry.GetChunks()) == 0 && entry.RemoteEntry != nil && entry.RemoteEntry.RemoteSize > 0
 }
 
 func (entry *Entry) IsDirectoryKeyObject() bool {
@@ -26,6 +29,10 @@ func (entry *Entry) FileMode() (fileMode os.FileMode) {
 		fileMode = os.FileMode(entry.Attributes.FileMode)
 	}
 	return
+}
+
+func (entry *Entry) IsOlderDir() bool {
+	return entry.IsDirectory && entry.Attributes != nil && entry.Attributes.Mime == "" && entry.Attributes.GetCrtime() <= time.Now().Unix()-cutoffTimeNewEmptyDir
 }
 
 func ToFileIdObject(fileIdStr string) (*FileId, error) {
@@ -101,8 +108,8 @@ func AfterEntryDeserialization(chunks []*FileChunk) {
 	}
 }
 
-func CreateEntry(client SeaweedFilerClient, request *CreateEntryRequest) error {
-	resp, err := client.CreateEntry(context.Background(), request)
+func CreateEntry(ctx context.Context, client SeaweedFilerClient, request *CreateEntryRequest) error {
+	resp, err := client.CreateEntry(ctx, request)
 	if err != nil {
 		glog.V(1).Infof("create entry %s/%s %v: %v", request.Directory, request.Entry.Name, request.OExcl, err)
 		return fmt.Errorf("CreateEntry: %v", err)
@@ -114,8 +121,8 @@ func CreateEntry(client SeaweedFilerClient, request *CreateEntryRequest) error {
 	return nil
 }
 
-func UpdateEntry(client SeaweedFilerClient, request *UpdateEntryRequest) error {
-	_, err := client.UpdateEntry(context.Background(), request)
+func UpdateEntry(ctx context.Context, client SeaweedFilerClient, request *UpdateEntryRequest) error {
+	_, err := client.UpdateEntry(ctx, request)
 	if err != nil {
 		glog.V(1).Infof("update entry %s/%s :%v", request.Directory, request.Entry.Name, err)
 		return fmt.Errorf("UpdateEntry: %v", err)
@@ -123,8 +130,8 @@ func UpdateEntry(client SeaweedFilerClient, request *UpdateEntryRequest) error {
 	return nil
 }
 
-func LookupEntry(client SeaweedFilerClient, request *LookupDirectoryEntryRequest) (*LookupDirectoryEntryResponse, error) {
-	resp, err := client.LookupDirectoryEntry(context.Background(), request)
+func LookupEntry(ctx context.Context, client SeaweedFilerClient, request *LookupDirectoryEntryRequest) (*LookupDirectoryEntryResponse, error) {
+	resp, err := client.LookupDirectoryEntry(ctx, request)
 	if err != nil {
 		if err == ErrNotFound || strings.Contains(err.Error(), ErrNotFound.Error()) {
 			return nil, ErrNotFound
@@ -143,18 +150,22 @@ var ErrNotFound = errors.New("filer: no entry is found in filer store")
 func IsEmpty(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry == nil && event.EventNotification.OldEntry == nil
 }
+
 func IsCreate(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry != nil && event.EventNotification.OldEntry == nil
 }
+
 func IsUpdate(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry != nil &&
 		event.EventNotification.OldEntry != nil &&
 		event.Directory == event.EventNotification.NewParentPath &&
 		event.EventNotification.NewEntry.Name == event.EventNotification.OldEntry.Name
 }
+
 func IsDelete(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry == nil && event.EventNotification.OldEntry != nil
 }
+
 func IsRename(event *SubscribeMetadataResponse) bool {
 	return event.EventNotification.NewEntry != nil &&
 		event.EventNotification.OldEntry != nil &&

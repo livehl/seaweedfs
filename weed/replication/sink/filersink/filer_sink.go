@@ -33,6 +33,7 @@ type FilerSink struct {
 	writeChunkByFiler bool
 	isIncremental     bool
 	executor          *util.LimitedConcurrentExecutor
+	signature         int32
 }
 
 func init() {
@@ -54,7 +55,7 @@ func (fs *FilerSink) IsIncremental() bool {
 func (fs *FilerSink) Initialize(configuration util.Configuration, prefix string) error {
 	fs.isIncremental = configuration.GetBool(prefix + "is_incremental")
 	fs.dataCenter = configuration.GetString(prefix + "dataCenter")
-	fs.executor = util.NewLimitedConcurrentExecutor(32)
+	fs.signature = util.RandomInt32()
 	return fs.DoInitialize(
 		"",
 		configuration.GetString(prefix+"grpcAddress"),
@@ -85,6 +86,7 @@ func (fs *FilerSink) DoInitialize(address, grpcAddress string, dir string,
 	fs.diskType = diskType
 	fs.grpcDialOption = grpcDialOption
 	fs.writeChunkByFiler = writeChunkByFiler
+	fs.executor = util.NewLimitedConcurrentExecutor(32)
 	return nil
 }
 
@@ -93,7 +95,7 @@ func (fs *FilerSink) DeleteEntry(key string, isDirectory, deleteIncludeChunks bo
 	dir, name := util.FullPath(key).DirAndName()
 
 	glog.V(4).Infof("delete entry: %v", key)
-	err := filer_pb.Remove(fs, dir, name, deleteIncludeChunks, true, true, true, signatures)
+	err := filer_pb.Remove(context.Background(), fs, dir, name, deleteIncludeChunks, true, true, true, signatures)
 	if err != nil {
 		glog.V(0).Infof("delete entry %s: %v", key, err)
 		return fmt.Errorf("delete entry %s: %v", key, err)
@@ -112,22 +114,27 @@ func (fs *FilerSink) CreateEntry(key string, entry *filer_pb.Entry, signatures [
 			Directory: dir,
 			Name:      name,
 		}
-		glog.V(1).Infof("lookup: %v", lookupRequest)
-		if resp, err := filer_pb.LookupEntry(client, lookupRequest); err == nil {
+		// glog.V(1).Infof("lookup: %v", lookupRequest)
+		if resp, err := filer_pb.LookupEntry(context.Background(), client, lookupRequest); err == nil {
 			if filer.ETag(resp.Entry) == filer.ETag(entry) {
 				glog.V(3).Infof("already replicated %s", key)
 				return nil
 			}
+			if resp.Entry.Attributes != nil && resp.Entry.Attributes.Mtime >= entry.Attributes.Mtime {
+				glog.V(3).Infof("skip overwriting %s", key)
+				return nil
+			}
 		}
 
-		replicatedChunks, err := fs.replicateChunks(entry.Chunks, key)
+		replicatedChunks, err := fs.replicateChunks(entry.GetChunks(), key)
 
 		if err != nil {
 			// only warning here since the source chunk may have been deleted already
 			glog.Warningf("replicate entry chunks %s: %v", key, err)
+			return nil
 		}
 
-		glog.V(4).Infof("replicated %s %+v ===> %+v", key, entry.Chunks, replicatedChunks)
+		// glog.V(4).Infof("replicated %s %+v ===> %+v", key, entry.GetChunks(), replicatedChunks)
 
 		request := &filer_pb.CreateEntryRequest{
 			Directory: dir,
@@ -145,7 +152,7 @@ func (fs *FilerSink) CreateEntry(key string, entry *filer_pb.Entry, signatures [
 		}
 
 		glog.V(3).Infof("create: %v", request)
-		if err := filer_pb.CreateEntry(client, request); err != nil {
+		if err := filer_pb.CreateEntry(context.Background(), client, request); err != nil {
 			glog.V(0).Infof("create entry %s: %v", key, err)
 			return fmt.Errorf("create entry %s: %v", key, err)
 		}
@@ -168,7 +175,7 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 		}
 
 		glog.V(4).Infof("lookup entry: %v", request)
-		resp, err := filer_pb.LookupEntry(client, request)
+		resp, err := filer_pb.LookupEntry(context.Background(), client, request)
 		if err != nil {
 			glog.V(0).Infof("lookup %s: %v", key, err)
 			return err
@@ -191,7 +198,7 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 		glog.V(2).Infof("late updates %s", key)
 	} else {
 		// find out what changed
-		deletedChunks, newChunks, err := compareChunks(filer.LookupFn(fs), oldEntry, newEntry)
+		deletedChunks, newChunks, err := compareChunks(context.Background(), filer.LookupFn(fs), oldEntry, newEntry)
 		if err != nil {
 			return true, fmt.Errorf("replicate %s compare chunks error: %v", key, err)
 		}
@@ -199,15 +206,16 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 		// delete the chunks that are deleted from the source
 		if deleteIncludeChunks {
 			// remove the deleted chunks. Actual data deletion happens in filer UpdateEntry FindUnusedFileChunks
-			existingEntry.Chunks = filer.DoMinusChunksBySourceFileId(existingEntry.Chunks, deletedChunks)
+			existingEntry.Chunks = filer.DoMinusChunksBySourceFileId(existingEntry.GetChunks(), deletedChunks)
 		}
 
 		// replicate the chunks that are new in the source
 		replicatedChunks, err := fs.replicateChunks(newChunks, key)
 		if err != nil {
-			return true, fmt.Errorf("replicate %s chunks error: %v", key, err)
+			glog.Warningf("replicate entry chunks %s: %v", key, err)
+			return true, nil
 		}
-		existingEntry.Chunks = append(existingEntry.Chunks, replicatedChunks...)
+		existingEntry.Chunks = append(existingEntry.GetChunks(), replicatedChunks...)
 		existingEntry.Attributes = newEntry.Attributes
 		existingEntry.Extended = newEntry.Extended
 		existingEntry.HardLinkId = newEntry.HardLinkId
@@ -234,12 +242,12 @@ func (fs *FilerSink) UpdateEntry(key string, oldEntry *filer_pb.Entry, newParent
 	})
 
 }
-func compareChunks(lookupFileIdFn wdclient.LookupFileIdFunctionType, oldEntry, newEntry *filer_pb.Entry) (deletedChunks, newChunks []*filer_pb.FileChunk, err error) {
-	aData, aMeta, aErr := filer.ResolveChunkManifest(lookupFileIdFn, oldEntry.Chunks, 0, math.MaxInt64)
+func compareChunks(ctx context.Context, lookupFileIdFn wdclient.LookupFileIdFunctionType, oldEntry, newEntry *filer_pb.Entry) (deletedChunks, newChunks []*filer_pb.FileChunk, err error) {
+	aData, aMeta, aErr := filer.ResolveChunkManifest(ctx, lookupFileIdFn, oldEntry.GetChunks(), 0, math.MaxInt64)
 	if aErr != nil {
 		return nil, nil, aErr
 	}
-	bData, bMeta, bErr := filer.ResolveChunkManifest(lookupFileIdFn, newEntry.Chunks, 0, math.MaxInt64)
+	bData, bMeta, bErr := filer.ResolveChunkManifest(ctx, lookupFileIdFn, newEntry.GetChunks(), 0, math.MaxInt64)
 	if bErr != nil {
 		return nil, nil, bErr
 	}

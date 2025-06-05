@@ -4,10 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 	"google.golang.org/grpc"
-	"io"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -27,12 +28,12 @@ const (
 )
 
 type FilerConf struct {
-	rules ptrie.Trie
+	rules ptrie.Trie[*filer_pb.FilerConf_PathConf]
 }
 
 func ReadFilerConf(filerGrpcAddress pb.ServerAddress, grpcDialOption grpc.DialOption, masterClient *wdclient.MasterClient) (*FilerConf, error) {
 	var buf bytes.Buffer
-	if err := pb.WithGrpcFilerClient(false, filerGrpcAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	if err := pb.WithGrpcFilerClient(false, 0, filerGrpcAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		if masterClient != nil {
 			return ReadEntry(masterClient, client, DirectoryEtcSeaweedFS, FilerConfName, &buf)
 		} else {
@@ -55,7 +56,7 @@ func ReadFilerConf(filerGrpcAddress pb.ServerAddress, grpcDialOption grpc.DialOp
 
 func NewFilerConf() (fc *FilerConf) {
 	fc = &FilerConf{
-		rules: ptrie.New(),
+		rules: ptrie.New[*filer_pb.FilerConf_PathConf](),
 	}
 	return fc
 }
@@ -75,7 +76,7 @@ func (fc *FilerConf) loadFromFiler(filer *Filer) (err error) {
 		return fc.LoadFromBytes(entry.Content)
 	}
 
-	return fc.loadFromChunks(filer, entry.Content, entry.Chunks, entry.Size())
+	return fc.loadFromChunks(filer, entry.Content, entry.GetChunks(), entry.Size())
 }
 
 func (fc *FilerConf) loadFromChunks(filer *Filer, content []byte, chunks []*filer_pb.FileChunk, size uint64) (err error) {
@@ -102,7 +103,7 @@ func (fc *FilerConf) LoadFromBytes(data []byte) (err error) {
 
 func (fc *FilerConf) doLoadConf(conf *filer_pb.FilerConf) (err error) {
 	for _, location := range conf.Locations {
-		err = fc.AddLocationConf(location)
+		err = fc.SetLocationConf(location)
 		if err != nil {
 			// this is not recoverable
 			return nil
@@ -111,7 +112,24 @@ func (fc *FilerConf) doLoadConf(conf *filer_pb.FilerConf) (err error) {
 	return nil
 }
 
+func (fc *FilerConf) GetLocationConf(locationPrefix string) (locConf *filer_pb.FilerConf_PathConf, found bool) {
+	return fc.rules.Get([]byte(locationPrefix))
+}
+
+func (fc *FilerConf) SetLocationConf(locConf *filer_pb.FilerConf_PathConf) (err error) {
+	err = fc.rules.Put([]byte(locConf.LocationPrefix), locConf)
+	if err != nil {
+		glog.Errorf("put location prefix: %v", err)
+	}
+	return
+}
+
 func (fc *FilerConf) AddLocationConf(locConf *filer_pb.FilerConf_PathConf) (err error) {
+	existingConf, found := fc.rules.Get([]byte(locConf.LocationPrefix))
+	if found {
+		mergePathConf(existingConf, locConf)
+		locConf = existingConf
+	}
 	err = fc.rules.Put([]byte(locConf.LocationPrefix), locConf)
 	if err != nil {
 		glog.Errorf("put location prefix: %v", err)
@@ -120,12 +138,13 @@ func (fc *FilerConf) AddLocationConf(locConf *filer_pb.FilerConf_PathConf) (err 
 }
 
 func (fc *FilerConf) DeleteLocationConf(locationPrefix string) {
-	rules := ptrie.New()
-	fc.rules.Walk(func(key []byte, value interface{}) bool {
+	rules := ptrie.New[*filer_pb.FilerConf_PathConf]()
+	fc.rules.Walk(func(key []byte, value *filer_pb.FilerConf_PathConf) bool {
 		if string(key) == locationPrefix {
 			return true
 		}
-		rules.Put(key, value)
+		key = bytes.Clone(key)
+		_ = rules.Put(key, value)
 		return true
 	})
 	fc.rules = rules
@@ -134,9 +153,8 @@ func (fc *FilerConf) DeleteLocationConf(locationPrefix string) {
 
 func (fc *FilerConf) MatchStorageRule(path string) (pathConf *filer_pb.FilerConf_PathConf) {
 	pathConf = &filer_pb.FilerConf_PathConf{}
-	fc.rules.MatchPrefix([]byte(path), func(key []byte, value interface{}) bool {
-		t := value.(*filer_pb.FilerConf_PathConf)
-		mergePathConf(pathConf, t)
+	fc.rules.MatchPrefix([]byte(path), func(key []byte, value *filer_pb.FilerConf_PathConf) bool {
+		mergePathConf(pathConf, value)
 		return true
 	})
 	return pathConf
@@ -144,10 +162,9 @@ func (fc *FilerConf) MatchStorageRule(path string) (pathConf *filer_pb.FilerConf
 
 func (fc *FilerConf) GetCollectionTtls(collection string) (ttls map[string]string) {
 	ttls = make(map[string]string)
-	fc.rules.Walk(func(key []byte, value interface{}) bool {
-		t := value.(*filer_pb.FilerConf_PathConf)
-		if t.Collection == collection {
-			ttls[t.LocationPrefix] = t.GetTtl()
+	fc.rules.Walk(func(key []byte, value *filer_pb.FilerConf_PathConf) bool {
+		if value.Collection == collection {
+			ttls[value.LocationPrefix] = value.GetTtl()
 		}
 		return true
 	})
@@ -165,16 +182,26 @@ func mergePathConf(a, b *filer_pb.FilerConf_PathConf) {
 		a.VolumeGrowthCount = b.VolumeGrowthCount
 	}
 	a.ReadOnly = b.ReadOnly || a.ReadOnly
+	if b.MaxFileNameLength > 0 {
+		a.MaxFileNameLength = b.MaxFileNameLength
+	}
 	a.DataCenter = util.Nvl(b.DataCenter, a.DataCenter)
 	a.Rack = util.Nvl(b.Rack, a.Rack)
 	a.DataNode = util.Nvl(b.DataNode, a.DataNode)
+	a.DisableChunkDeletion = b.DisableChunkDeletion || a.DisableChunkDeletion
+	a.Worm = b.Worm || a.Worm
+	if b.WormRetentionTimeSeconds > 0 {
+		a.WormRetentionTimeSeconds = b.WormRetentionTimeSeconds
+	}
+	if b.WormGracePeriodSeconds > 0 {
+		a.WormGracePeriodSeconds = b.WormGracePeriodSeconds
+	}
 }
 
 func (fc *FilerConf) ToProto() *filer_pb.FilerConf {
 	m := &filer_pb.FilerConf{}
-	fc.rules.Walk(func(key []byte, value interface{}) bool {
-		pathConf := value.(*filer_pb.FilerConf_PathConf)
-		m.Locations = append(m.Locations, pathConf)
+	fc.rules.Walk(func(key []byte, value *filer_pb.FilerConf_PathConf) bool {
+		m.Locations = append(m.Locations, value)
 		return true
 	})
 	return m

@@ -1,12 +1,15 @@
 package filer
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
@@ -20,21 +23,21 @@ type ReaderCache struct {
 }
 
 type SingleChunkCacher struct {
-	sync.Mutex
-	parent           *ReaderCache
-	chunkFileId      string
-	data             []byte
-	err              error
-	cipherKey        []byte
-	isGzipped        bool
-	chunkSize        int
-	shouldCache      bool
-	wg               sync.WaitGroup
-	cacheStartedCh   chan struct{}
 	completedTimeNew int64
+	sync.Mutex
+	parent         *ReaderCache
+	chunkFileId    string
+	data           []byte
+	err            error
+	cipherKey      []byte
+	isGzipped      bool
+	chunkSize      int
+	shouldCache    bool
+	wg             sync.WaitGroup
+	cacheStartedCh chan struct{}
 }
 
-func newReaderCache(limit int, chunkCache chunk_cache.ChunkCache, lookupFileIdFn wdclient.LookupFileIdFunctionType) *ReaderCache {
+func NewReaderCache(limit int, chunkCache chunk_cache.ChunkCache, lookupFileIdFn wdclient.LookupFileIdFunctionType) *ReaderCache {
 	return &ReaderCache{
 		limit:          limit,
 		chunkCache:     chunkCache,
@@ -43,7 +46,7 @@ func newReaderCache(limit int, chunkCache chunk_cache.ChunkCache, lookupFileIdFn
 	}
 }
 
-func (rc *ReaderCache) MaybeCache(chunkViews []*ChunkView) {
+func (rc *ReaderCache) MaybeCache(chunkViews *Interval[*ChunkView]) {
 	if rc.lookupFileIdFn == nil {
 		return
 	}
@@ -55,8 +58,13 @@ func (rc *ReaderCache) MaybeCache(chunkViews []*ChunkView) {
 		return
 	}
 
-	for _, chunkView := range chunkViews {
+	for x := chunkViews; x != nil; x = x.Next {
+		chunkView := x.Value
 		if _, found := rc.downloaders[chunkView.FileId]; found {
+			continue
+		}
+		if rc.chunkCache.IsInCache(chunkView.FileId, true) {
+			glog.V(4).Infof("%s is in cache", chunkView.FileId)
 			continue
 		}
 
@@ -65,9 +73,10 @@ func (rc *ReaderCache) MaybeCache(chunkViews []*ChunkView) {
 			return
 		}
 
-		// glog.V(4).Infof("prefetch %s offset %d", chunkView.FileId, chunkView.LogicOffset)
+		// glog.V(4).Infof("prefetch %s offset %d", chunkView.FileId, chunkView.ViewOffset)
 		// cache this chunk if not yet
-		cacher := newSingleChunkCacher(rc, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int(chunkView.ChunkSize), false)
+		shouldCache := (uint64(chunkView.ViewOffset) + chunkView.ChunkSize) <= rc.chunkCache.GetMaxFilePartSizeInCache()
+		cacher := newSingleChunkCacher(rc, chunkView.FileId, chunkView.CipherKey, chunkView.IsGzipped, int(chunkView.ChunkSize), shouldCache)
 		go cacher.startCaching()
 		<-cacher.cacheStartedCh
 		rc.downloaders[chunkView.FileId] = cacher
@@ -161,7 +170,7 @@ func (s *SingleChunkCacher) startCaching() {
 
 	s.cacheStartedCh <- struct{}{} // means this has been started
 
-	urlStrings, err := s.parent.lookupFileIdFn(s.chunkFileId)
+	urlStrings, err := s.parent.lookupFileIdFn(context.Background(), s.chunkFileId)
 	if err != nil {
 		s.err = fmt.Errorf("operation LookupFileId %s failed, err: %v", s.chunkFileId, err)
 		return
@@ -169,7 +178,7 @@ func (s *SingleChunkCacher) startCaching() {
 
 	s.data = mem.Allocate(s.chunkSize)
 
-	_, s.err = retriedFetchChunkData(s.data, urlStrings, s.cipherKey, s.isGzipped, true, 0)
+	_, s.err = util_http.RetriedFetchChunkData(context.Background(), s.data, urlStrings, s.cipherKey, s.isGzipped, true, 0)
 	if s.err != nil {
 		mem.Free(s.data)
 		s.data = nil
@@ -207,7 +216,7 @@ func (s *SingleChunkCacher) readChunkAt(buf []byte, offset int64) (int, error) {
 		return 0, s.err
 	}
 
-	if len(s.data) == 0 {
+	if len(s.data) <= int(offset) {
 		return 0, nil
 	}
 

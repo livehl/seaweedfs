@@ -19,7 +19,7 @@ func (fs *FilerServer) AtomicRenameEntry(ctx context.Context, req *filer_pb.Atom
 	oldParent := util.FullPath(filepath.ToSlash(req.OldDirectory))
 	newParent := util.FullPath(filepath.ToSlash(req.NewDirectory))
 
-	if err := fs.filer.CanRename(oldParent, newParent); err != nil {
+	if err := fs.filer.CanRename(oldParent, newParent, req.OldName); err != nil {
 		return nil, err
 	}
 
@@ -55,7 +55,7 @@ func (fs *FilerServer) StreamRenameEntry(req *filer_pb.StreamRenameEntryRequest,
 	oldParent := util.FullPath(filepath.ToSlash(req.OldDirectory))
 	newParent := util.FullPath(filepath.ToSlash(req.NewDirectory))
 
-	if err := fs.filer.CanRename(oldParent, newParent); err != nil {
+	if err := fs.filer.CanRename(oldParent, newParent, req.OldName); err != nil {
 		return err
 	}
 
@@ -165,7 +165,7 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 	newEntry := &filer.Entry{
 		FullPath:        newPath,
 		Attr:            entry.Attr,
-		Chunks:          entry.Chunks,
+		Chunks:          entry.GetChunks(),
 		Extended:        entry.Extended,
 		Content:         entry.Content,
 		HardLinkCounter: entry.HardLinkCounter,
@@ -173,7 +173,7 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 		Remote:          entry.Remote,
 		Quota:           entry.Quota,
 	}
-	if createErr := fs.filer.CreateEntry(ctx, newEntry, false, false, signatures, false); createErr != nil {
+	if createErr := fs.filer.CreateEntry(ctx, newEntry, false, false, signatures, false, fs.filer.MaxFilenameLength); createErr != nil {
 		return createErr
 	}
 	if stream != nil {
@@ -202,7 +202,8 @@ func (fs *FilerServer) moveSelfEntry(ctx context.Context, stream filer_pb.Seawee
 	}
 
 	// delete old entry
-	deleteErr := fs.filer.DeleteEntryMetaAndData(ctx, oldPath, false, false, false, false, signatures)
+	ctx = context.WithValue(ctx, "OP", "MV")
+	deleteErr := fs.filer.DeleteEntryMetaAndData(ctx, oldPath, false, false, false, false, signatures, 0)
 	if deleteErr != nil {
 		return deleteErr
 	}

@@ -1,14 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -21,8 +25,8 @@ var (
 )
 
 func main() {
-
 	flag.Parse()
+	util_http.InitGlobalHttpClient()
 
 	if *isWrite {
 		startGenerateMetadata()
@@ -52,12 +56,12 @@ func main() {
 }
 
 func startGenerateMetadata() {
-	pb.WithFilerClient(false, pb.ServerAddress(*tailFiler), grpc.WithTransportCredentials(insecure.NewCredentials()), func(client filer_pb.SeaweedFilerClient) error {
+	pb.WithFilerClient(false, util.RandomInt32(), pb.ServerAddress(*tailFiler), grpc.WithTransportCredentials(insecure.NewCredentials()), func(client filer_pb.SeaweedFilerClient) error {
 
 		for i := 0; i < *n; i++ {
 			name := fmt.Sprintf("file%d", i)
 			glog.V(0).Infof("write %s/%s", *dir, name)
-			if err := filer_pb.CreateEntry(client, &filer_pb.CreateEntryRequest{
+			if err := filer_pb.CreateEntry(context.Background(), client, &filer_pb.CreateEntryRequest{
 				Directory: *dir,
 				Entry: &filer_pb.Entry{
 					Name: name,
@@ -78,7 +82,24 @@ func startGenerateMetadata() {
 
 func startSubscribeMetadata(eachEntryFunc func(event *filer_pb.SubscribeMetadataResponse) error) {
 
-	tailErr := pb.FollowMetadata(pb.ServerAddress(*tailFiler), grpc.WithTransportCredentials(insecure.NewCredentials()), "tail", 0, 0, *dir, nil, 0, 0, 0, eachEntryFunc, pb.TrivialOnError)
+	prefix := *dir
+	if !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
+	}
+
+	metadataFollowOption := &pb.MetadataFollowOption{
+		ClientName:             "tail",
+		ClientId:               0,
+		ClientEpoch:            0,
+		SelfSignature:          0,
+		PathPrefix:             prefix,
+		AdditionalPathPrefixes: nil,
+		DirectoriesToWatch:     nil,
+		StartTsNs:              0,
+		StopTsNs:               0,
+		EventErrorType:         pb.TrivialOnError,
+	}
+	tailErr := pb.FollowMetadata(pb.ServerAddress(*tailFiler), grpc.WithTransportCredentials(insecure.NewCredentials()), metadataFollowOption, eachEntryFunc)
 
 	if tailErr != nil {
 		fmt.Printf("tail %s: %v\n", *tailFiler, tailErr)

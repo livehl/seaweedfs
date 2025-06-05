@@ -3,6 +3,7 @@ package command
 import (
 	"context"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"net/http"
 	"time"
 
@@ -52,7 +53,7 @@ var cmdMasterFollower = &Command{
 	In most cases, the master follower is not needed. In big data centers with thousands of volume
 	servers. In theory, the master may have trouble to keep up with the write requests and read requests.
 
-	The master follower can relieve the master from from read requests, which only needs to
+	The master follower can relieve the master from read requests, which only needs to
 	lookup a fileId or volumeId.
 
 	The master follower currently can handle fileId lookup requests:
@@ -68,7 +69,7 @@ var cmdMasterFollower = &Command{
 
 func runMasterFollower(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	util.LoadConfiguration("master", false)
 
 	if *mf.portGrpc == 0 {
@@ -119,7 +120,7 @@ func startMasterFollower(masterOptions MasterOptions) {
 	r := mux.NewRouter()
 	ms := weed_server.NewMasterServer(r, option, masters)
 	listeningAddress := util.JoinHostPort(*masterOptions.ipBind, *masterOptions.port)
-	glog.V(0).Infof("Start Seaweed Master %s at %s", util.Version(), listeningAddress)
+	glog.V(0).Infof("Start Seaweed Master %s at %s", version.Version(), listeningAddress)
 	masterListener, masterLocalListener, e := util.NewIpAndLocalListeners(*masterOptions.ipBind, *masterOptions.port, 0)
 	if e != nil {
 		glog.Fatalf("Master startup error: %v", e)
@@ -134,13 +135,13 @@ func startMasterFollower(masterOptions MasterOptions) {
 	grpcS := pb.NewGrpcServer(security.LoadServerTLS(util.GetViper(), "grpc.master"))
 	master_pb.RegisterSeaweedServer(grpcS, ms)
 	reflection.Register(grpcS)
-	glog.V(0).Infof("Start Seaweed Master %s grpc server at %s:%d", util.Version(), *masterOptions.ip, grpcPort)
+	glog.V(0).Infof("Start Seaweed Master %s grpc server at %s:%d", version.Version(), *masterOptions.ip, grpcPort)
 	if grpcLocalL != nil {
 		go grpcS.Serve(grpcLocalL)
 	}
 	go grpcS.Serve(grpcL)
 
-	go ms.MasterClient.KeepConnectedToMaster()
+	go ms.MasterClient.KeepConnectedToMaster(context.Background())
 
 	// start http server
 	httpS := &http.Server{Handler: r}

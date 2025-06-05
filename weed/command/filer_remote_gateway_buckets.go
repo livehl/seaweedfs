@@ -1,6 +1,7 @@
 package command
 
 import (
+	"context"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -30,17 +31,40 @@ func (option *RemoteGatewayOptions) followBucketUpdatesAndUploadToRemote(filerSo
 		return err
 	}
 
-	processEventFnWithOffset := pb.AddOffsetFunc(eachEntryFunc, 3*time.Second, func(counter int64, lastTsNs int64) error {
-		lastTime := time.Unix(0, lastTsNs)
-		glog.V(0).Infof("remote sync %s progressed to %v %0.2f/sec", *option.filerAddress, lastTime, float64(counter)/float64(3))
-		return remote_storage.SetSyncOffset(option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, lastTsNs)
+	lastOffsetTs := collectLastSyncOffset(option, option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, *option.timeAgo)
+	processor := NewMetadataProcessor(eachEntryFunc, 128, lastOffsetTs.UnixNano())
+
+	var lastLogTsNs = time.Now().UnixNano()
+	processEventFnWithOffset := pb.AddOffsetFunc(func(resp *filer_pb.SubscribeMetadataResponse) error {
+		processor.AddSyncJob(resp)
+		return nil
+	}, 3*time.Second, func(counter int64, lastTsNs int64) error {
+		offsetTsNs := processor.processedTsWatermark.Load()
+		if offsetTsNs == 0 {
+			return nil
+		}
+		now := time.Now().UnixNano()
+		glog.V(0).Infof("remote sync %s progressed to %v %0.2f/sec", *option.filerAddress, time.Unix(0, offsetTsNs), float64(counter)/(float64(now-lastLogTsNs)/1e9))
+		lastLogTsNs = now
+		return remote_storage.SetSyncOffset(option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, offsetTsNs)
 	})
 
-	lastOffsetTs := collectLastSyncOffset(option, option.grpcDialOption, pb.ServerAddress(*option.filerAddress), option.bucketsDir, *option.timeAgo)
-
 	option.clientEpoch++
-	return pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, "filer.remote.sync", option.clientId, option.clientEpoch,
-		option.bucketsDir, []string{filer.DirectoryEtcRemote}, lastOffsetTs.UnixNano(), 0, 0, processEventFnWithOffset, pb.TrivialOnError)
+
+	metadataFollowOption := &pb.MetadataFollowOption{
+		ClientName:             "filer.remote.sync",
+		ClientId:               option.clientId,
+		ClientEpoch:            option.clientEpoch,
+		SelfSignature:          0,
+		PathPrefix:             option.bucketsDir + "/",
+		AdditionalPathPrefixes: []string{filer.DirectoryEtcRemote},
+		DirectoriesToWatch:     nil,
+		StartTsNs:              lastOffsetTs.UnixNano(),
+		StopTsNs:               0,
+		EventErrorType:         pb.RetryForeverOnError,
+	}
+
+	return pb.FollowMetadata(pb.ServerAddress(*option.filerAddress), option.grpcDialOption, metadataFollowOption, processEventFnWithOffset)
 }
 
 func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *source.FilerSource) (pb.ProcessMetadataFunc, error) {
@@ -211,7 +235,7 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 			if writeErr != nil {
 				return writeErr
 			}
-			return updateLocalEntry(&remoteSyncOptions, message.NewParentPath, message.NewEntry, remoteEntry)
+			return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 		}
 		if filer_pb.IsDelete(resp) {
 			if resp.Directory == option.bucketsDir {
@@ -248,6 +272,9 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 					}
 				}
 			}
+			if isMultipartUploadFile(message.NewParentPath, message.NewEntry.Name) {
+				return nil
+			}
 			oldBucket, oldRemoteStorageMountLocation, oldRemoteStorage, oldOk := option.detectBucketInfo(resp.Directory)
 			newBucket, newRemoteStorageMountLocation, newRemoteStorage, newOk := option.detectBucketInfo(message.NewParentPath)
 			if oldOk && newOk {
@@ -275,7 +302,7 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 						if writeErr != nil {
 							return writeErr
 						}
-						return updateLocalEntry(&remoteSyncOptions, message.NewParentPath, message.NewEntry, remoteEntry)
+						return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 					}
 				}
 			}
@@ -312,7 +339,7 @@ func (option *RemoteGatewayOptions) makeBucketedEventProcessor(filerSource *sour
 				if writeErr != nil {
 					return writeErr
 				}
-				return updateLocalEntry(&remoteSyncOptions, message.NewParentPath, message.NewEntry, remoteEntry)
+				return updateLocalEntry(option, message.NewParentPath, message.NewEntry, remoteEntry)
 			}
 		}
 
@@ -372,6 +399,9 @@ func extractBucketPath(bucketsDir, dir string) (util.FullPath, bool) {
 func (option *RemoteGatewayOptions) collectRemoteStorageConf() (err error) {
 
 	if mappings, err := filer.ReadMountMappings(option.grpcDialOption, pb.ServerAddress(*option.filerAddress)); err != nil {
+		if err == filer_pb.ErrNotFound {
+			return fmt.Errorf("remote storage is not configured in filer server")
+		}
 		return err
 	} else {
 		option.mappings = mappings
@@ -379,7 +409,7 @@ func (option *RemoteGatewayOptions) collectRemoteStorageConf() (err error) {
 
 	option.remoteConfs = make(map[string]*remote_pb.RemoteConf)
 	var lastConfName string
-	err = filer_pb.List(option, filer.DirectoryEtcRemote, "", func(entry *filer_pb.Entry, isLast bool) error {
+	err = filer_pb.List(context.Background(), option, filer.DirectoryEtcRemote, "", func(entry *filer_pb.Entry, isLast bool) error {
 		if !strings.HasSuffix(entry.Name, filer.REMOTE_STORAGE_CONF_SUFFIX) {
 			return nil
 		}

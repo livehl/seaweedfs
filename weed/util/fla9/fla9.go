@@ -1059,10 +1059,12 @@ func (f *FlagSet) ParseEnv(environ []string) error {
 		}
 
 		envKey := strings.ToUpper(flag.Name)
+
 		if f.envPrefix != "" {
 			envKey = f.envPrefix + "_" + envKey
 		}
 		envKey = strings.Replace(envKey, "-", "_", -1)
+		envKey = strings.Replace(envKey, ".", "_", -1)
 
 		value, isSet := env[envKey]
 		if !isSet {

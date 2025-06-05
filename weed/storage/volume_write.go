@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"time"
+	"syscall"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
@@ -24,7 +24,7 @@ func (v *Volume) checkReadWriteError(err error) {
 		}
 		return
 	}
-	if err.Error() == "input/output error" {
+	if errors.Is(err, syscall.EIO) {
 		v.lastIoError = err
 	}
 }
@@ -52,8 +52,24 @@ func (v *Volume) isFileUnchanged(n *needle.Needle) bool {
 	return false
 }
 
+var ErrVolumeNotEmpty = fmt.Errorf("volume not empty")
+
 // Destroy removes everything related to this volume
-func (v *Volume) Destroy() (err error) {
+func (v *Volume) Destroy(onlyEmpty bool) (err error) {
+	v.dataFileAccessLock.Lock()
+	defer v.dataFileAccessLock.Unlock()
+
+	if onlyEmpty {
+		isEmpty, e := v.doIsEmpty()
+		if e != nil {
+			err = fmt.Errorf("failed to read isEmpty %v", e)
+			return
+		}
+		if !isEmpty {
+			err = ErrVolumeNotEmpty
+			return
+		}
+	}
 	if v.isCompacting || v.isCommitCompacting {
 		err = fmt.Errorf("volume %d is compacting", v.Id)
 		return
@@ -65,7 +81,7 @@ func (v *Volume) Destroy() (err error) {
 			backendStorage.DeleteFile(storageKey)
 		}
 	}
-	v.Close()
+	v.doClose()
 	removeVolumeFiles(v.DataFileName())
 	removeVolumeFiles(v.IndexFileName())
 	return
@@ -93,15 +109,8 @@ func (v *Volume) asyncRequestAppend(request *needle.AsyncRequest) {
 
 func (v *Volume) syncWrite(n *needle.Needle, checkCookie bool) (offset uint64, size Size, isUnchanged bool, err error) {
 	// glog.V(4).Infof("writing needle %s", needle.NewFileIdFromNeedle(v.Id, n).String())
-	actualSize := needle.GetActualSize(Size(len(n.Data)), v.Version())
-
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
-
-	if MaxPossibleVolumeSize < v.nm.ContentSize()+uint64(actualSize) {
-		err = fmt.Errorf("volume size limit %d exceeded! current size is %d", MaxPossibleVolumeSize, v.nm.ContentSize())
-		return
-	}
 
 	return v.doWriteRequest(n, checkCookie)
 }
@@ -157,10 +166,12 @@ func (v *Volume) doWriteRequest(n *needle.Needle, checkCookie bool) (offset uint
 	}
 
 	// append to dat file
-	n.AppendAtNs = uint64(time.Now().UnixNano())
-	offset, size, _, err = n.Append(v.DataBackend, v.Version())
+	n.UpdateAppendAtNs(v.lastAppendAtNs)
+	var actualSize int64
+	offset, size, actualSize, err = n.Append(v.DataBackend, v.Version())
 	v.checkReadWriteError(err)
 	if err != nil {
+		err = fmt.Errorf("append to volume %d size %d actualSize %d: %v", v.Id, size, actualSize, err)
 		return
 	}
 	v.lastAppendAtNs = n.AppendAtNs
@@ -179,13 +190,11 @@ func (v *Volume) doWriteRequest(n *needle.Needle, checkCookie bool) (offset uint
 
 func (v *Volume) syncDelete(n *needle.Needle) (Size, error) {
 	// glog.V(4).Infof("delete needle %s", needle.NewFileIdFromNeedle(v.Id, n).String())
-	actualSize := needle.GetActualSize(0, v.Version())
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 
-	if MaxPossibleVolumeSize < v.nm.ContentSize()+uint64(actualSize) {
-		err := fmt.Errorf("volume size limit %d exceeded! current size is %d", MaxPossibleVolumeSize, v.nm.ContentSize())
-		return 0, err
+	if v.nm == nil {
+		return 0, nil
 	}
 
 	return v.doDeleteRequest(n)
@@ -213,13 +222,17 @@ func (v *Volume) doDeleteRequest(n *needle.Needle) (Size, error) {
 	nv, ok := v.nm.Get(n.Id)
 	// fmt.Println("key", n.Id, "volume offset", nv.Offset, "data_size", n.Size, "cached size", nv.Size)
 	if ok && nv.Size.IsValid() {
+		var offset uint64
+		var err error
 		size := nv.Size
-		n.Data = nil
-		n.AppendAtNs = uint64(time.Now().UnixNano())
-		offset, _, _, err := n.Append(v.DataBackend, v.Version())
-		v.checkReadWriteError(err)
-		if err != nil {
-			return size, err
+		if !v.hasRemoteFile {
+			n.Data = nil
+			n.UpdateAppendAtNs(v.lastAppendAtNs)
+			offset, _, _, err = n.Append(v.DataBackend, v.Version())
+			v.checkReadWriteError(err)
+			if err != nil {
+				return size, err
+			}
 		}
 		v.lastAppendAtNs = n.AppendAtNs
 		if err = v.nm.Delete(n.Id, ToOffset(int64(offset))); err != nil {
@@ -314,7 +327,20 @@ func (v *Volume) WriteNeedleBlob(needleId NeedleId, needleBlob []byte, size Size
 		return fmt.Errorf("volume size limit %d exceeded! current size is %d", MaxPossibleVolumeSize, v.nm.ContentSize())
 	}
 
-	appendAtNs := uint64(time.Now().UnixNano())
+	nv, ok := v.nm.Get(needleId)
+	if ok && nv.Size == size {
+		oldNeedle := new(needle.Needle)
+		err := oldNeedle.ReadData(v.DataBackend, nv.Offset.ToActualOffset(), nv.Size, v.Version())
+		if err == nil {
+			newNeedle := new(needle.Needle)
+			err = newNeedle.ReadBytes(needleBlob, nv.Offset.ToActualOffset(), size, v.Version())
+			if err == nil && oldNeedle.Cookie == newNeedle.Cookie && oldNeedle.Checksum == newNeedle.Checksum && bytes.Equal(oldNeedle.Data, newNeedle.Data) {
+				glog.V(0).Infof("needle %v already exists", needleId)
+				return nil
+			}
+		}
+	}
+	appendAtNs := needle.GetAppendAtNs(v.lastAppendAtNs)
 	offset, err := needle.WriteNeedleBlob(v.DataBackend, needleBlob, size, appendAtNs, v.Version())
 
 	v.checkReadWriteError(err)

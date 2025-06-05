@@ -28,6 +28,10 @@ func (c *commandS3BucketDelete) Help() string {
 `
 }
 
+func (c *commandS3BucketDelete) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandS3BucketDelete) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	bucketCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -54,7 +58,7 @@ func (c *commandS3BucketDelete) Do(args []string, commandEnv *CommandEnv, writer
 	// delete the collection directly first
 	err = commandEnv.MasterClient.WithClient(false, func(client master_pb.SeaweedClient) error {
 		_, err = client.CollectionDelete(context.Background(), &master_pb.CollectionDeleteRequest{
-			Name: *bucketName,
+			Name: getCollectionName(commandEnv, *bucketName),
 		})
 		return err
 	})
@@ -62,6 +66,6 @@ func (c *commandS3BucketDelete) Do(args []string, commandEnv *CommandEnv, writer
 		return
 	}
 
-	return filer_pb.Remove(commandEnv, filerBucketsPath, *bucketName, false, true, true, false, nil)
+	return filer_pb.Remove(context.Background(), commandEnv, filerBucketsPath, *bucketName, false, true, true, false, nil)
 
 }

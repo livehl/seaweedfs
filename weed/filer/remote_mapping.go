@@ -11,13 +11,15 @@ import (
 
 func ReadMountMappings(grpcDialOption grpc.DialOption, filerAddress pb.ServerAddress) (mappings *remote_pb.RemoteStorageMapping, readErr error) {
 	var oldContent []byte
-	if readErr = pb.WithFilerClient(false, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	if readErr = pb.WithFilerClient(false, 0, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		oldContent, readErr = ReadInsideFiler(client, DirectoryEtcRemote, REMOTE_STORAGE_MOUNT_FILE)
 		return readErr
 	}); readErr != nil {
-		return nil, readErr
+		if readErr != filer_pb.ErrNotFound {
+			return nil, fmt.Errorf("read existing mapping: %v", readErr)
+		}
+		oldContent = nil
 	}
-
 	mappings, readErr = UnmarshalRemoteStorageMappings(oldContent)
 	if readErr != nil {
 		return nil, fmt.Errorf("unmarshal mappings: %v", readErr)

@@ -2,11 +2,12 @@ package needle_map
 
 import (
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/sequence"
-	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"log"
 	"os"
 	"testing"
+
+	"github.com/seaweedfs/seaweedfs/weed/sequence"
+	. "github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 func TestSnowflakeSequencer(t *testing.T) {
@@ -65,15 +66,15 @@ func TestIssue52(t *testing.T) {
 
 func TestCompactMap(t *testing.T) {
 	m := NewCompactMap()
-	for i := uint32(0); i < 100*batch; i += 2 {
+	for i := uint32(0); i < 100*MaxSectionBucketSize; i += 2 {
 		m.Set(NeedleId(i), ToOffset(int64(i)), Size(i))
 	}
 
-	for i := uint32(0); i < 100*batch; i += 37 {
+	for i := uint32(0); i < 100*MaxSectionBucketSize; i += 37 {
 		m.Delete(NeedleId(i))
 	}
 
-	for i := uint32(0); i < 10*batch; i += 3 {
+	for i := uint32(0); i < 10*MaxSectionBucketSize; i += 3 {
 		m.Set(NeedleId(i), ToOffset(int64(i+11)), Size(i+5))
 	}
 
@@ -83,7 +84,7 @@ func TestCompactMap(t *testing.T) {
 	//		}
 	//	}
 
-	for i := uint32(0); i < 10*batch; i++ {
+	for i := uint32(0); i < 10*MaxSectionBucketSize; i++ {
 		v, ok := m.Get(NeedleId(i))
 		if i%3 == 0 {
 			if !ok {
@@ -103,7 +104,7 @@ func TestCompactMap(t *testing.T) {
 		}
 	}
 
-	for i := uint32(10 * batch); i < 100*batch; i++ {
+	for i := uint32(10 * MaxSectionBucketSize); i < 100*MaxSectionBucketSize; i++ {
 		v, ok := m.Get(NeedleId(i))
 		if i%37 == 0 {
 			if ok && v.Size.IsValid() {
@@ -150,7 +151,7 @@ func TestOverflow(t *testing.T) {
 		t.Fatalf("expecting 5 entries now: %+v", cs.overflow)
 	}
 
-	_, x, _ := cs.findOverflowEntry(5)
+	x, _ := cs.findOverflowEntry(5)
 	if x.Key != 5 {
 		t.Fatalf("expecting entry 5 now: %+v", x)
 	}
@@ -196,7 +197,7 @@ func TestCompactSection_Get(t *testing.T) {
 	maps = append(maps, m)
 	totalRowCount += rowCount
 	m.Set(1574318345753513987, ToOffset(10002), 10002)
-	nv,ok := m.Get(1574318345753513987)
+	nv, ok := m.Get(1574318345753513987)
 	if ok {
 		t.Log(uint64(nv.Key))
 	}
@@ -207,14 +208,34 @@ func TestCompactSection_Get(t *testing.T) {
 	}
 
 	m.Set(1574318350048481283, ToOffset(10002), 10002)
-	nv2,ok1 := m.Get(1574318350048481283)
+	nv2, ok1 := m.Get(1574318350048481283)
 	if ok1 {
 		t.Log(uint64(nv2.Key))
 	}
 
 	m.Delete(nv2.Key)
-	nv3,has := m.Get(nv2.Key)
+	nv3, has := m.Get(nv2.Key)
 	if has && nv3.Size > 0 {
 		t.Error(uint64(nv3.Size))
+	}
+}
+
+// Test after putting 1 ~ LookBackWindowSize*3 items in sequential order, but missing item LookBackWindowSize
+// insert the item LookBackWindowSize in the middle of the sequence
+func TestCompactSection_PutOutOfOrderItemBeyondLookBackWindow(t *testing.T) {
+	m := NewCompactMap()
+
+	// put 1 ~ 10
+	for i := 1; i <= LookBackWindowSize*3; i++ {
+		if i != LookBackWindowSize {
+			m.Set(NeedleId(i), ToOffset(int64(i)), Size(i))
+		}
+	}
+
+	m.Set(NeedleId(LookBackWindowSize), ToOffset(int64(LookBackWindowSize)), Size(LookBackWindowSize))
+
+	// check if 8 is in the right place
+	if v, ok := m.Get(NeedleId(LookBackWindowSize)); !ok || v.Offset != ToOffset(LookBackWindowSize) || v.Size != Size(LookBackWindowSize) {
+		t.Fatalf("expected to find LookBackWindowSize at offset %d with size %d, but got %v", LookBackWindowSize, LookBackWindowSize, v)
 	}
 }

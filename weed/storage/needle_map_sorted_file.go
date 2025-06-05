@@ -27,7 +27,7 @@ func NewSortedFileNeedleMap(indexBaseFileName string, indexFile *os.File) (m *So
 	}
 	glog.V(1).Infof("Opening %s...", fileName)
 
-	if m.dbFile, err = os.Open(indexBaseFileName + ".sdx"); err != nil {
+	if m.dbFile, err = os.OpenFile(indexBaseFileName+".sdx", os.O_RDWR, 0); err != nil {
 		return
 	}
 	dbStat, _ := m.dbFile.Stat()
@@ -35,6 +35,7 @@ func NewSortedFileNeedleMap(indexBaseFileName string, indexFile *os.File) (m *So
 	glog.V(1).Infof("Loading %s...", indexFile.Name())
 	mm, indexLoadError := newNeedleMapMetricFromIndexFile(indexFile)
 	if indexLoadError != nil {
+		_ = m.dbFile.Close()
 		return nil, indexLoadError
 	}
 	m.mapMetric = *mm
@@ -94,6 +95,9 @@ func (m *SortedFileNeedleMap) Delete(key NeedleId, offset Offset) error {
 }
 
 func (m *SortedFileNeedleMap) Close() {
+	if m == nil {
+		return
+	}
 	if m.indexFile != nil {
 		m.indexFile.Close()
 	}

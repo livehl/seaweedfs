@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -55,7 +56,7 @@ The backup writes to another filer store specified in a backup_filer.toml.
 
 func runFilerMetaBackup(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	metaBackup.grpcDialOption = security.LoadClientTLS(util.GetViper(), "grpc.client")
 
 	// load backup_filer.toml
@@ -63,9 +64,9 @@ func runFilerMetaBackup(cmd *Command, args []string) bool {
 	v.SetConfigFile(*metaBackup.backupFilerConfig)
 
 	if err := v.ReadInConfig(); err != nil { // Handle errors reading the config file
-		glog.Fatalf("Failed to load %s file.\nPlease use this command to generate the a %s.toml file\n"+
+		glog.Fatalf("Failed to load %s file: %v\nPlease use this command to generate the a %s.toml file\n"+
 			"    weed scaffold -config=%s -output=.\n\n\n",
-			*metaBackup.backupFilerConfig, "backup_filer", "filer")
+			*metaBackup.backupFilerConfig, err, "backup_filer", "filer")
 	}
 
 	if err := metaBackup.initStore(v); err != nil {
@@ -196,8 +197,25 @@ func (metaBackup *FilerMetaBackupOptions) streamMetadataBackup() error {
 	})
 
 	metaBackup.clientEpoch++
-	return pb.FollowMetadata(pb.ServerAddress(*metaBackup.filerAddress), metaBackup.grpcDialOption, "meta_backup", metaBackup.clientId, metaBackup.clientEpoch,
-		*metaBackup.filerDirectory, nil, startTime.UnixNano(), 0, 0, processEventFnWithOffset, pb.TrivialOnError)
+
+	prefix := *metaBackup.filerDirectory
+	if !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
+	}
+	metadataFollowOption := &pb.MetadataFollowOption{
+		ClientName:             "meta_backup",
+		ClientId:               metaBackup.clientId,
+		ClientEpoch:            metaBackup.clientEpoch,
+		SelfSignature:          0,
+		PathPrefix:             prefix,
+		AdditionalPathPrefixes: nil,
+		DirectoriesToWatch:     nil,
+		StartTsNs:              startTime.UnixNano(),
+		StopTsNs:               0,
+		EventErrorType:         pb.RetryForeverOnError,
+	}
+
+	return pb.FollowMetadata(pb.ServerAddress(*metaBackup.filerAddress), metaBackup.grpcDialOption, metadataFollowOption, processEventFnWithOffset)
 
 }
 
@@ -225,7 +243,7 @@ var _ = filer_pb.FilerClient(&FilerMetaBackupOptions{})
 
 func (metaBackup *FilerMetaBackupOptions) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 
-	return pb.WithFilerClient(streamingMode, pb.ServerAddress(*metaBackup.filerAddress), metaBackup.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	return pb.WithFilerClient(streamingMode, metaBackup.clientId, pb.ServerAddress(*metaBackup.filerAddress), metaBackup.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		return fn(client)
 	})
 

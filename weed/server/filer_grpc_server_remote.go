@@ -64,7 +64,7 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 	}
 
 	// detect storage option
-	so, err := fs.detectStorageOption(req.Directory, "", "", 0, "", "", "", "")
+	so, err := fs.detectStorageOption(ctx, req.Directory, "", "", 0, "", "", "", "")
 	if err != nil {
 		return resp, err
 	}
@@ -97,7 +97,7 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 			}
 
 			// assign one volume server
-			assignResult, err := operation.Assign(fs.filer.GetMaster, fs.grpcDialOption, assignRequest, altRequest)
+			assignResult, err := operation.Assign(ctx, fs.filer.GetMaster, fs.grpcDialOption, assignRequest, altRequest)
 			if err != nil {
 				fetchAndWriteErr = err
 				return
@@ -123,8 +123,9 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 
 			// tell filer to tell volume server to download into needles
 			assignedServerAddress := pb.NewServerAddressWithGrpcPort(assignResult.Url, assignResult.GrpcPort)
+			var etag string
 			err = operation.WithVolumeServerClient(false, assignedServerAddress, fs.grpcDialOption, func(volumeServerClient volume_server_pb.VolumeServerClient) error {
-				_, fetchAndWriteErr := volumeServerClient.FetchAndWriteNeedle(context.Background(), &volume_server_pb.FetchAndWriteNeedleRequest{
+				resp, fetchAndWriteErr := volumeServerClient.FetchAndWriteNeedle(context.Background(), &volume_server_pb.FetchAndWriteNeedleRequest{
 					VolumeId:   uint32(fileId.VolumeId),
 					NeedleId:   uint64(fileId.Key),
 					Cookie:     uint32(fileId.Cookie),
@@ -141,6 +142,8 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 				})
 				if fetchAndWriteErr != nil {
 					return fmt.Errorf("volume server %s fetchAndWrite %s: %v", assignResult.Url, dest, fetchAndWriteErr)
+				} else {
+					etag = resp.ETag
 				}
 				return nil
 			})
@@ -151,10 +154,12 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 			}
 
 			chunks = append(chunks, &filer_pb.FileChunk{
-				FileId: assignResult.Fid,
-				Offset: localOffset,
-				Size:   uint64(size),
-				Mtime:  time.Now().Unix(),
+
+				FileId:       assignResult.Fid,
+				Offset:       localOffset,
+				Size:         uint64(size),
+				ModifiedTsNs: time.Now().UnixNano(),
+				ETag:         etag,
 				Fid: &filer_pb.FileId{
 					VolumeId: uint32(fileId.VolumeId),
 					FileKey:  uint64(fileId.Key),
@@ -169,7 +174,7 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 		return nil, fetchAndWriteErr
 	}
 
-	garbage := entry.Chunks
+	garbage := entry.GetChunks()
 
 	newEntry := entry.ShallowClone()
 	newEntry.Chunks = chunks
@@ -179,10 +184,10 @@ func (fs *FilerServer) CacheRemoteObjectToLocalCluster(ctx context.Context, req 
 	// this skips meta data log events
 
 	if err := fs.filer.Store.UpdateEntry(context.Background(), newEntry); err != nil {
-		fs.filer.DeleteChunks(chunks)
+		fs.filer.DeleteUncommittedChunks(ctx, chunks)
 		return nil, err
 	}
-	fs.filer.DeleteChunks(garbage)
+	fs.filer.DeleteChunks(ctx, entry.FullPath, garbage)
 
 	fs.filer.NotifyUpdateEvent(ctx, entry, newEntry, true, false, nil)
 

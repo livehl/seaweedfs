@@ -4,6 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"regexp"
+	"strings"
+	"sync/atomic"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -16,9 +22,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 	"google.golang.org/grpc"
-	"os"
-	"strings"
-	"time"
 )
 
 type SyncOptions struct {
@@ -43,10 +46,13 @@ type SyncOptions struct {
 	bFromTsMs       *int64
 	aProxyByFiler   *bool
 	bProxyByFiler   *bool
+	metricsHttpIp   *string
 	metricsHttpPort *int
 	concurrency     *int
+	aDoDeleteFiles  *bool
+	bDoDeleteFiles  *bool
 	clientId        int32
-	clientEpoch     int32
+	clientEpoch     atomic.Int32
 }
 
 const (
@@ -86,7 +92,10 @@ func init() {
 	syncOptions.concurrency = cmdFilerSynchronize.Flag.Int("concurrency", DefaultConcurrencyLimit, "The maximum number of files that will be synced concurrently.")
 	syncCpuProfile = cmdFilerSynchronize.Flag.String("cpuprofile", "", "cpu profile output file")
 	syncMemProfile = cmdFilerSynchronize.Flag.String("memprofile", "", "memory profile output file")
+	syncOptions.metricsHttpIp = cmdFilerSynchronize.Flag.String("metricsIp", "", "metrics listen ip")
 	syncOptions.metricsHttpPort = cmdFilerSynchronize.Flag.Int("metricsPort", 0, "metrics listen port")
+	syncOptions.aDoDeleteFiles = cmdFilerSynchronize.Flag.Bool("a.doDeleteFiles", true, "delete and update files when synchronizing on filer A")
+	syncOptions.bDoDeleteFiles = cmdFilerSynchronize.Flag.Bool("b.doDeleteFiles", true, "delete and update files when synchronizing on filer B")
 	syncOptions.clientId = util.RandomInt32()
 }
 
@@ -110,7 +119,7 @@ var cmdFilerSynchronize = &Command{
 
 func runFilerSynchronize(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
 
 	grace.SetupProfiling(*syncCpuProfile, *syncMemProfile)
@@ -119,7 +128,7 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 	filerB := pb.ServerAddress(*syncOptions.filerB)
 
 	// start filer.sync metrics server
-	go statsCollect.StartMetricsServer(*syncOptions.metricsHttpPort)
+	go statsCollect.StartMetricsServer(*syncOptions.metricsHttpIp, *syncOptions.metricsHttpPort)
 
 	// read a filer signature
 	aFilerSignature, aFilerErr := replication.ReadFilerSignature(grpcDialOption, filerA)
@@ -143,10 +152,10 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 			os.Exit(2)
 		}
 		for {
-			syncOptions.clientEpoch++
+			syncOptions.clientEpoch.Add(1)
 			err := doSubscribeFilerMetaChanges(
 				syncOptions.clientId,
-				syncOptions.clientEpoch,
+				syncOptions.clientEpoch.Load(),
 				grpcDialOption,
 				filerA,
 				*syncOptions.aPath,
@@ -161,6 +170,7 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 				*syncOptions.bDiskType,
 				*syncOptions.bDebug,
 				*syncOptions.concurrency,
+				*syncOptions.bDoDeleteFiles,
 				aFilerSignature,
 				bFilerSignature)
 			if err != nil {
@@ -180,10 +190,10 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 		}
 		go func() {
 			for {
-				syncOptions.clientEpoch++
+				syncOptions.clientEpoch.Add(1)
 				err := doSubscribeFilerMetaChanges(
 					syncOptions.clientId,
-					syncOptions.clientEpoch,
+					syncOptions.clientEpoch.Load(),
 					grpcDialOption,
 					filerB,
 					*syncOptions.bPath,
@@ -198,6 +208,7 @@ func runFilerSynchronize(cmd *Command, args []string) bool {
 					*syncOptions.aDiskType,
 					*syncOptions.aDebug,
 					*syncOptions.concurrency,
+					*syncOptions.aDoDeleteFiles,
 					bFilerSignature,
 					aFilerSignature)
 				if err != nil {
@@ -230,7 +241,7 @@ func initOffsetFromTsMs(grpcDialOption grpc.DialOption, targetFiler pb.ServerAdd
 }
 
 func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, grpcDialOption grpc.DialOption, sourceFiler pb.ServerAddress, sourcePath string, sourceExcludePaths []string, sourceReadChunkFromFiler bool, targetFiler pb.ServerAddress, targetPath string,
-	replicationStr, collection string, ttlSec int, sinkWriteChunkByFiler bool, diskType string, debug bool, concurrency int, sourceFilerSignature int32, targetFilerSignature int32) error {
+	replicationStr, collection string, ttlSec int, sinkWriteChunkByFiler bool, diskType string, debug bool, concurrency int, doDeleteFiles bool, sourceFilerSignature int32, targetFilerSignature int32) error {
 
 	// if first time, start from now
 	// if has previously synced, resume from that point of time
@@ -248,7 +259,7 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, grpcDialOpti
 	filerSink.DoInitialize(targetFiler.ToHttpAddress(), targetFiler.ToGrpcAddress(), targetPath, replicationStr, collection, ttlSec, diskType, grpcDialOption, sinkWriteChunkByFiler)
 	filerSink.SetSourceFiler(filerSource)
 
-	persistEventFn := genProcessFunction(sourcePath, targetPath, sourceExcludePaths, filerSink, debug)
+	persistEventFn := genProcessFunction(sourcePath, targetPath, sourceExcludePaths, nil, filerSink, doDeleteFiles, debug)
 
 	processEventFn := func(resp *filer_pb.SubscribeMetadataResponse) error {
 		message := resp.EventNotification
@@ -265,7 +276,7 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, grpcDialOpti
 		glog.Warningf("invalid concurrency value, using default: %d", DefaultConcurrencyLimit)
 		concurrency = DefaultConcurrencyLimit
 	}
-	processor := NewMetadataProcessor(processEventFn, concurrency)
+	processor := NewMetadataProcessor(processEventFn, concurrency, sourceFilerOffsetTsNs)
 
 	var lastLogTsNs = time.Now().UnixNano()
 	var clientName = fmt.Sprintf("syncFrom_%s_To_%s", string(sourceFiler), string(targetFiler))
@@ -273,20 +284,38 @@ func doSubscribeFilerMetaChanges(clientId int32, clientEpoch int32, grpcDialOpti
 		processor.AddSyncJob(resp)
 		return nil
 	}, 3*time.Second, func(counter int64, lastTsNs int64) error {
-		if processor.processedTsWatermark == 0 {
+		offsetTsNs := processor.processedTsWatermark.Load()
+		if offsetTsNs == 0 {
 			return nil
 		}
 		// use processor.processedTsWatermark instead of the lastTsNs from the most recent job
 		now := time.Now().UnixNano()
-		glog.V(0).Infof("sync %s to %s progressed to %v %0.2f/sec", sourceFiler, targetFiler, time.Unix(0, processor.processedTsWatermark), float64(counter)/(float64(now-lastLogTsNs)/1e9))
+		glog.V(0).Infof("sync %s to %s progressed to %v %0.2f/sec", sourceFiler, targetFiler, time.Unix(0, offsetTsNs), float64(counter)/(float64(now-lastLogTsNs)/1e9))
 		lastLogTsNs = now
 		// collect synchronous offset
-		statsCollect.FilerSyncOffsetGauge.WithLabelValues(sourceFiler.String(), targetFiler.String(), clientName, sourcePath).Set(float64(processor.processedTsWatermark))
-		return setOffset(grpcDialOption, targetFiler, getSignaturePrefixByPath(sourcePath), sourceFilerSignature, processor.processedTsWatermark)
+		statsCollect.FilerSyncOffsetGauge.WithLabelValues(sourceFiler.String(), targetFiler.String(), clientName, sourcePath).Set(float64(offsetTsNs))
+		return setOffset(grpcDialOption, targetFiler, getSignaturePrefixByPath(sourcePath), sourceFilerSignature, offsetTsNs)
 	})
 
-	return pb.FollowMetadata(sourceFiler, grpcDialOption, clientName, clientId, clientEpoch,
-		sourcePath, nil, sourceFilerOffsetTsNs, 0, targetFilerSignature, processEventFnWithOffset, pb.RetryForeverOnError)
+	prefix := sourcePath
+	if !strings.HasSuffix(prefix, "/") {
+		prefix = prefix + "/"
+	}
+
+	metadataFollowOption := &pb.MetadataFollowOption{
+		ClientName:             clientName,
+		ClientId:               clientId,
+		ClientEpoch:            clientEpoch,
+		SelfSignature:          targetFilerSignature,
+		PathPrefix:             prefix,
+		AdditionalPathPrefixes: nil,
+		DirectoriesToWatch:     nil,
+		StartTsNs:              sourceFilerOffsetTsNs,
+		StopTsNs:               0,
+		EventErrorType:         pb.RetryForeverOnError,
+	}
+
+	return pb.FollowMetadata(sourceFiler, grpcDialOption, metadataFollowOption, processEventFnWithOffset)
 
 }
 
@@ -302,7 +331,7 @@ func getSignaturePrefixByPath(path string) string {
 
 func getOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signaturePrefix string, signature int32) (lastOffsetTsNs int64, readErr error) {
 
-	readErr = pb.WithFilerClient(false, filer, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	readErr = pb.WithFilerClient(false, signature, filer, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		syncKey := []byte(signaturePrefix + "____")
 		util.Uint32toBytes(syncKey[len(signaturePrefix):len(signaturePrefix)+4], uint32(signature))
 
@@ -328,7 +357,7 @@ func getOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signature
 }
 
 func setOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signaturePrefix string, signature int32, offsetTsNs int64) error {
-	return pb.WithFilerClient(false, filer, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	return pb.WithFilerClient(false, signature, filer, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 
 		syncKey := []byte(signaturePrefix + "____")
 		util.Uint32toBytes(syncKey[len(signaturePrefix):len(signaturePrefix)+4], uint32(signature))
@@ -354,7 +383,7 @@ func setOffset(grpcDialOption grpc.DialOption, filer pb.ServerAddress, signature
 
 }
 
-func genProcessFunction(sourcePath string, targetPath string, excludePaths []string, dataSink sink.ReplicationSink, debug bool) func(resp *filer_pb.SubscribeMetadataResponse) error {
+func genProcessFunction(sourcePath string, targetPath string, excludePaths []string, reExcludeFileName *regexp.Regexp, dataSink sink.ReplicationSink, doDeleteFiles bool, debug bool) func(resp *filer_pb.SubscribeMetadataResponse) error {
 	// process function
 	processEventFn := func(resp *filer_pb.SubscribeMetadataResponse) error {
 		message := resp.EventNotification
@@ -371,24 +400,34 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 			glog.V(0).Infof("received %v", resp)
 		}
 
-		if !strings.HasPrefix(resp.Directory, sourcePath) {
+		if isMultipartUploadDir(resp.Directory + "/") {
+			return nil
+		}
+
+		if !strings.HasPrefix(resp.Directory+"/", sourcePath) {
 			return nil
 		}
 		for _, excludePath := range excludePaths {
-			if strings.HasPrefix(resp.Directory, excludePath) {
+			if strings.HasPrefix(resp.Directory+"/", excludePath) {
 				return nil
 			}
 		}
+		if reExcludeFileName != nil && reExcludeFileName.MatchString(message.NewEntry.Name) {
+			return nil
+		}
+		if dataSink.IsIncremental() {
+			doDeleteFiles = false
+		}
 		// handle deletions
 		if filer_pb.IsDelete(resp) {
+			if !doDeleteFiles {
+				return nil
+			}
 			if !strings.HasPrefix(string(sourceOldKey), sourcePath) {
 				return nil
 			}
 			key := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
-			if !dataSink.IsIncremental() {
-				return dataSink.DeleteEntry(key, message.OldEntry.IsDirectory, message.DeleteChunks, message.Signatures)
-			}
-			return nil
+			return dataSink.DeleteEntry(key, message.OldEntry.IsDirectory, message.DeleteChunks, message.Signatures)
 		}
 
 		// handle new entries
@@ -397,7 +436,11 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 				return nil
 			}
 			key := buildKey(dataSink, message, targetPath, sourceNewKey, sourcePath)
-			return dataSink.CreateEntry(key, message.NewEntry, message.Signatures)
+			if err := dataSink.CreateEntry(key, message.NewEntry, message.Signatures); err != nil {
+				return fmt.Errorf("create entry1 : %w", err)
+			} else {
+				return nil
+			}
 		}
 
 		// this is something special?
@@ -410,9 +453,13 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 			// old key is in the watched directory
 			if strings.HasPrefix(string(sourceNewKey), sourcePath) {
 				// new key is also in the watched directory
-				if !dataSink.IsIncremental() {
+				if doDeleteFiles {
 					oldKey := util.Join(targetPath, string(sourceOldKey)[len(sourcePath):])
-					message.NewParentPath = util.Join(targetPath, message.NewParentPath[len(sourcePath):])
+					if strings.HasSuffix(sourcePath, "/") {
+						message.NewParentPath = util.Join(targetPath, message.NewParentPath[len(sourcePath)-1:])
+					} else {
+						message.NewParentPath = util.Join(targetPath, message.NewParentPath[len(sourcePath):])
+					}
 					foundExisting, err := dataSink.UpdateEntry(string(oldKey), message.OldEntry, message.NewParentPath, message.NewEntry, message.DeleteChunks, message.Signatures)
 					if foundExisting {
 						return err
@@ -420,28 +467,36 @@ func genProcessFunction(sourcePath string, targetPath string, excludePaths []str
 
 					// not able to find old entry
 					if err = dataSink.DeleteEntry(string(oldKey), message.OldEntry.IsDirectory, false, message.Signatures); err != nil {
-						return fmt.Errorf("delete old entry %v: %v", oldKey, err)
+						return fmt.Errorf("delete old entry %v: %w", oldKey, err)
 					}
 				}
 				// create the new entry
 				newKey := buildKey(dataSink, message, targetPath, sourceNewKey, sourcePath)
-				return dataSink.CreateEntry(newKey, message.NewEntry, message.Signatures)
+				if err := dataSink.CreateEntry(newKey, message.NewEntry, message.Signatures); err != nil {
+					return fmt.Errorf("create entry2 : %w", err)
+				} else {
+					return nil
+				}
 
 			} else {
-				// new key is outside of the watched directory
-				if !dataSink.IsIncremental() {
+				// new key is outside the watched directory
+				if doDeleteFiles {
 					key := buildKey(dataSink, message, targetPath, sourceOldKey, sourcePath)
 					return dataSink.DeleteEntry(key, message.OldEntry.IsDirectory, message.DeleteChunks, message.Signatures)
 				}
 			}
 		} else {
-			// old key is outside of the watched directory
+			// old key is outside the watched directory
 			if strings.HasPrefix(string(sourceNewKey), sourcePath) {
 				// new key is in the watched directory
 				key := buildKey(dataSink, message, targetPath, sourceNewKey, sourcePath)
-				return dataSink.CreateEntry(key, message.NewEntry, message.Signatures)
+				if err := dataSink.CreateEntry(key, message.NewEntry, message.Signatures); err != nil {
+					return fmt.Errorf("create entry3 : %w", err)
+				} else {
+					return nil
+				}
 			} else {
-				// new key is also outside of the watched directory
+				// new key is also outside the watched directory
 				// skip
 			}
 		}

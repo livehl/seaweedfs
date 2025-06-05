@@ -5,8 +5,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"golang.org/x/exp/slices"
 	"path"
+	"slices"
 )
 
 type OnDiskCacheLayer struct {
@@ -32,8 +32,8 @@ func NewOnDiskCacheLayer(dir, namePrefix string, diskSize int64, segmentCount in
 	}
 
 	// keep newest cache to the front
-	slices.SortFunc(c.diskCaches, func(a, b *ChunkCacheVolume) bool {
-		return a.lastModTime.After(b.lastModTime)
+	slices.SortFunc(c.diskCaches, func(a, b *ChunkCacheVolume) int {
+		return b.lastModTime.Compare(a.lastModTime)
 	})
 	return c
 }

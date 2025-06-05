@@ -1,6 +1,7 @@
 package shell
 
 import (
+	"context"
 	"fmt"
 	"io"
 
@@ -29,6 +30,10 @@ func (c *commandFsDu) Help() string {
 `
 }
 
+func (c *commandFsDu) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandFsDu) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	path, err := commandEnv.parseUrl(findInputDirectory(args))
@@ -54,7 +59,7 @@ func (c *commandFsDu) Do(args []string, commandEnv *CommandEnv, writer io.Writer
 
 func duTraverseDirectory(writer io.Writer, filerClient filer_pb.FilerClient, dir, name string) (blockCount, byteCount uint64, err error) {
 
-	err = filer_pb.ReadDirAllEntries(filerClient, util.FullPath(dir), name, func(entry *filer_pb.Entry, isLast bool) error {
+	err = filer_pb.ReadDirAllEntries(context.Background(), filerClient, util.FullPath(dir), name, func(entry *filer_pb.Entry, isLast bool) error {
 
 		var fileBlockCount, fileByteCount uint64
 
@@ -69,7 +74,7 @@ func duTraverseDirectory(writer io.Writer, filerClient filer_pb.FilerClient, dir
 				byteCount += numByte
 			}
 		} else {
-			fileBlockCount = uint64(len(entry.Chunks))
+			fileBlockCount = uint64(len(entry.GetChunks()))
 			fileByteCount = filer.FileSize(entry)
 			blockCount += fileBlockCount
 			byteCount += fileByteCount

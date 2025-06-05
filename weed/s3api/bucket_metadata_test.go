@@ -1,12 +1,12 @@
 package s3api
 
 import (
+	"encoding/json"
 	"fmt"
-	"github.com/aws/aws-sdk-go/private/protocol/json/jsonutil"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/iam_pb"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
-	"github.com/seaweedfs/seaweedfs/weed/s3api/s3account"
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
 	"reflect"
 	"sync"
@@ -26,18 +26,13 @@ var (
 	}
 
 	//good entry
-	goodEntryAcp, _ = jsonutil.BuildJSON(&s3.AccessControlPolicy{
-		Owner: &s3.Owner{
-			DisplayName: &s3account.AccountAdmin.Name,
-			ID:          &s3account.AccountAdmin.Id,
-		},
-		Grants: s3_constants.PublicRead,
-	})
-	goodEntry = &filer_pb.Entry{
+	goodEntryAcl, _ = json.Marshal(s3_constants.PublicRead)
+	goodEntry       = &filer_pb.Entry{
 		Name: "entryWithValidAcp",
 		Extended: map[string][]byte{
 			s3_constants.ExtOwnershipKey: []byte(s3_constants.OwnershipBucketOwnerEnforced),
-			s3_constants.ExtAcpKey:       goodEntryAcp,
+			s3_constants.ExtAmzOwnerKey:  []byte(AccountAdmin.DisplayName),
+			s3_constants.ExtAmzAclKey:    goodEntryAcl,
 		},
 	}
 
@@ -57,35 +52,28 @@ var (
 		},
 	}
 
-	//acp is ""
+	//owner is ""
 	acpEmptyStr = &filer_pb.Entry{
 		Name: "acpEmptyStr",
 		Extended: map[string][]byte{
-			s3_constants.ExtAcpKey: []byte(""),
+			s3_constants.ExtAmzOwnerKey: []byte(""),
 		},
 	}
 
-	//acp is empty object
-	acpEmptyObjectAcp, _ = jsonutil.BuildJSON(&s3.AccessControlPolicy{
-		Owner:  nil,
-		Grants: nil,
-	})
+	//owner not exists
 	acpEmptyObject = &filer_pb.Entry{
 		Name: "acpEmptyObject",
 		Extended: map[string][]byte{
-			s3_constants.ExtAcpKey: acpEmptyObjectAcp,
+			s3_constants.ExtAmzOwnerKey: []byte("xxxxx"),
 		},
 	}
 
-	//acp owner is nil
-	acpOwnerNilAcp, _ = jsonutil.BuildJSON(&s3.AccessControlPolicy{
-		Owner:  nil,
-		Grants: make([]*s3.Grant, 1),
-	})
-	acpOwnerNil = &filer_pb.Entry{
+	//grants is nil
+	acpOwnerNilAcp, _ = json.Marshal(make([]*s3.Grant, 0))
+	acpOwnerNil       = &filer_pb.Entry{
 		Name: "acpOwnerNil",
 		Extended: map[string][]byte{
-			s3_constants.ExtAcpKey: acpOwnerNilAcp,
+			s3_constants.ExtAmzAclKey: acpOwnerNilAcp,
 		},
 	}
 
@@ -100,8 +88,8 @@ var tcs = []*BucketMetadataTestCase{
 			Name:            badEntry.Name,
 			ObjectOwnership: s3_constants.DefaultOwnershipForExists,
 			Owner: &s3.Owner{
-				DisplayName: &s3account.AccountAdmin.Name,
-				ID:          &s3account.AccountAdmin.Id,
+				DisplayName: &AccountAdmin.DisplayName,
+				ID:          &AccountAdmin.Id,
 			},
 			Acl: nil,
 		},
@@ -111,8 +99,8 @@ var tcs = []*BucketMetadataTestCase{
 			Name:            goodEntry.Name,
 			ObjectOwnership: s3_constants.OwnershipBucketOwnerEnforced,
 			Owner: &s3.Owner{
-				DisplayName: &s3account.AccountAdmin.Name,
-				ID:          &s3account.AccountAdmin.Id,
+				DisplayName: &AccountAdmin.DisplayName,
+				ID:          &AccountAdmin.Id,
 			},
 			Acl: s3_constants.PublicRead,
 		},
@@ -122,8 +110,8 @@ var tcs = []*BucketMetadataTestCase{
 			Name:            ownershipEmptyStr.Name,
 			ObjectOwnership: s3_constants.DefaultOwnershipForExists,
 			Owner: &s3.Owner{
-				DisplayName: &s3account.AccountAdmin.Name,
-				ID:          &s3account.AccountAdmin.Id,
+				DisplayName: &AccountAdmin.DisplayName,
+				ID:          &AccountAdmin.Id,
 			},
 			Acl: nil,
 		},
@@ -133,8 +121,8 @@ var tcs = []*BucketMetadataTestCase{
 			Name:            ownershipValid.Name,
 			ObjectOwnership: s3_constants.OwnershipBucketOwnerEnforced,
 			Owner: &s3.Owner{
-				DisplayName: &s3account.AccountAdmin.Name,
-				ID:          &s3account.AccountAdmin.Id,
+				DisplayName: &AccountAdmin.DisplayName,
+				ID:          &AccountAdmin.Id,
 			},
 			Acl: nil,
 		},
@@ -144,8 +132,8 @@ var tcs = []*BucketMetadataTestCase{
 			Name:            acpEmptyStr.Name,
 			ObjectOwnership: s3_constants.DefaultOwnershipForExists,
 			Owner: &s3.Owner{
-				DisplayName: &s3account.AccountAdmin.Name,
-				ID:          &s3account.AccountAdmin.Id,
+				DisplayName: &AccountAdmin.DisplayName,
+				ID:          &AccountAdmin.Id,
 			},
 			Acl: nil,
 		},
@@ -155,8 +143,8 @@ var tcs = []*BucketMetadataTestCase{
 			Name:            acpEmptyObject.Name,
 			ObjectOwnership: s3_constants.DefaultOwnershipForExists,
 			Owner: &s3.Owner{
-				DisplayName: &s3account.AccountAdmin.Name,
-				ID:          &s3account.AccountAdmin.Id,
+				DisplayName: &AccountAdmin.DisplayName,
+				ID:          &AccountAdmin.Id,
 			},
 			Acl: nil,
 		},
@@ -166,8 +154,8 @@ var tcs = []*BucketMetadataTestCase{
 			Name:            acpOwnerNil.Name,
 			ObjectOwnership: s3_constants.DefaultOwnershipForExists,
 			Owner: &s3.Owner{
-				DisplayName: &s3account.AccountAdmin.Name,
-				ID:          &s3account.AccountAdmin.Id,
+				DisplayName: &AccountAdmin.DisplayName,
+				ID:          &AccountAdmin.Id,
 			},
 			Acl: make([]*s3.Grant, 0),
 		},
@@ -175,8 +163,10 @@ var tcs = []*BucketMetadataTestCase{
 }
 
 func TestBuildBucketMetadata(t *testing.T) {
+	iam := &IdentityAccessManagement{}
+	_ = iam.loadS3ApiConfiguration(&iam_pb.S3ApiConfiguration{})
 	for _, tc := range tcs {
-		resultBucketMetadata := buildBucketMetadata(tc.filerEntry)
+		resultBucketMetadata := buildBucketMetadata(iam, tc.filerEntry)
 		if !reflect.DeepEqual(resultBucketMetadata, tc.expectBucketMetadata) {
 			t.Fatalf("result is unexpect: \nresult: %v, \nexpect: %v", resultBucketMetadata, tc.expectBucketMetadata)
 		}

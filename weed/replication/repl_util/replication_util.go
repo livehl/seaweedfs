@@ -1,17 +1,19 @@
 package repl_util
 
 import (
+	"context"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/replication/source"
-	"github.com/seaweedfs/seaweedfs/weed/util"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
-func CopyFromChunkViews(chunkViews []*filer.ChunkView, filerSource *source.FilerSource, writeFunc func(data []byte) error) error {
+func CopyFromChunkViews(chunkViews *filer.IntervalList[*filer.ChunkView], filerSource *source.FilerSource, writeFunc func(data []byte) error) error {
 
-	for _, chunk := range chunkViews {
+	for x := chunkViews.Front(); x != nil; x = x.Next {
+		chunk := x.Value
 
-		fileUrls, err := filerSource.LookupFileId(chunk.FileId)
+		fileUrls, err := filerSource.LookupFileId(context.Background(), chunk.FileId)
 		if err != nil {
 			return err
 		}
@@ -20,7 +22,7 @@ func CopyFromChunkViews(chunkViews []*filer.ChunkView, filerSource *source.Filer
 		var shouldRetry bool
 
 		for _, fileUrl := range fileUrls {
-			shouldRetry, err = util.ReadUrlAsStream(fileUrl, chunk.CipherKey, chunk.IsGzipped, chunk.IsFullChunk(), chunk.Offset, int(chunk.Size), func(data []byte) {
+			shouldRetry, err = util_http.ReadUrlAsStream(context.Background(), fileUrl, chunk.CipherKey, chunk.IsGzipped, chunk.IsFullChunk(), chunk.OffsetInChunk, int(chunk.ViewSize), func(data []byte) {
 				writeErr = writeFunc(data)
 			})
 			if err != nil {

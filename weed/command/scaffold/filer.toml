@@ -12,6 +12,7 @@
 # with http DELETE, by default the filer would check whether a folder is empty.
 # recursive_delete will delete all sub folders and files, similar to "rm -Rf"
 recursive_delete = false
+#max_file_name_length = 255
 
 ####################################################
 # The following are filer store options
@@ -41,15 +42,22 @@ enabled = false
 dbFile = "./filer.db"                # sqlite db file
 
 [mysql]  # or memsql, tidb
-# CREATE TABLE IF NOT EXISTS filemeta (
-#   dirhash     BIGINT               COMMENT 'first 64 bits of MD5 hash value of directory field',
-#   name        VARCHAR(1000) BINARY COMMENT 'directory or file name',
-#   directory   TEXT BINARY          COMMENT 'full path to parent directory',
-#   meta        LONGBLOB,
-#   PRIMARY KEY (dirhash, name)
-# ) DEFAULT CHARSET=utf8;
+# CREATE TABLE IF NOT EXISTS `filemeta` (
+#   `dirhash`   BIGINT NOT NULL       COMMENT 'first 64 bits of MD5 hash value of directory field',
+#   `name`      VARCHAR(766) NOT NULL COMMENT 'directory or file name',
+#   `directory` TEXT NOT NULL         COMMENT 'full path to parent directory',
+#   `meta`      LONGBLOB,
+#   PRIMARY KEY (`dirhash`, `name`)
+# ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 enabled = false
+# dsn will take priority over "hostname, port, username, password, database".
+# [username[:password]@][protocol[(address)]]/dbname[?param1=value1&...&paramN=valueN]
+dsn = "root@tcp(localhost:3306)/seaweedfs?collation=utf8mb4_bin"
+enable_tls = false
+ca_crt = ""                # ca.crt dir when enable_tls set true
+client_crt = ""            # mysql client.crt dir when enable_tls set true
+client_key = ""            # mysql client.key dir when enable_tls set true
 hostname = "localhost"
 port = 3306
 username = "root"
@@ -61,18 +69,18 @@ connection_max_lifetime_seconds = 0
 interpolateParams = false
 # if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
 enableUpsert = true
-upsertQuery = """INSERT INTO `%s` (dirhash,name,directory,meta) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE meta = VALUES(meta)"""
+upsertQuery = """INSERT INTO `%s` (`dirhash`,`name`,`directory`,`meta`) VALUES (?,?,?,?) AS `new` ON DUPLICATE KEY UPDATE `meta` = `new`.`meta`"""
 
 [mysql2]  # or memsql, tidb
 enabled = false
 createTable = """
   CREATE TABLE IF NOT EXISTS `%s` (
-    dirhash BIGINT,
-    name VARCHAR(1000) BINARY,
-    directory TEXT BINARY,
-    meta LONGBLOB,
-    PRIMARY KEY (dirhash, name)
-  ) DEFAULT CHARSET=utf8;
+    `dirhash`   BIGINT NOT NULL,
+    `name`      VARCHAR(766) NOT NULL,
+    `directory` TEXT NOT NULL,
+    `meta`      LONGBLOB,
+    PRIMARY KEY (`dirhash`, `name`)
+  ) DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 """
 hostname = "localhost"
 port = 3306
@@ -85,7 +93,7 @@ connection_max_lifetime_seconds = 0
 interpolateParams = false
 # if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
 enableUpsert = true
-upsertQuery = """INSERT INTO `%s` (dirhash,name,directory,meta) VALUES(?,?,?,?) ON DUPLICATE KEY UPDATE meta = VALUES(meta)"""
+upsertQuery = """INSERT INTO `%s` (`dirhash`,`name`,`directory`,`meta`) VALUES (?,?,?,?) AS `new` ON DUPLICATE KEY UPDATE `meta` = `new`.`meta`"""
 
 [postgres] # or cockroachdb, YugabyteDB
 # CREATE TABLE IF NOT EXISTS filemeta (
@@ -108,7 +116,13 @@ connection_max_open = 100
 connection_max_lifetime_seconds = 0
 # if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
 enableUpsert = true
-upsertQuery = """INSERT INTO "%[1]s" (dirhash,name,directory,meta) VALUES($1,$2,$3,$4) ON CONFLICT (dirhash,name) DO UPDATE SET meta = EXCLUDED.meta WHERE "%[1]s".meta != EXCLUDED.meta"""
+upsertQuery = """
+  INSERT INTO "%[1]s" (dirhash, name, directory, meta)
+    VALUES($1, $2, $3, $4)
+    ON CONFLICT (dirhash, name) DO UPDATE SET
+      directory=EXCLUDED.directory,
+      meta=EXCLUDED.meta
+"""
 
 [postgres2]
 enabled = false
@@ -133,14 +147,21 @@ connection_max_open = 100
 connection_max_lifetime_seconds = 0
 # if insert/upsert failing, you can disable upsert or update query syntax to match your RDBMS syntax:
 enableUpsert = true
-upsertQuery = """INSERT INTO "%[1]s" (dirhash,name,directory,meta) VALUES($1,$2,$3,$4) ON CONFLICT (dirhash,name) DO UPDATE SET meta = EXCLUDED.meta WHERE "%[1]s".meta != EXCLUDED.meta"""
+upsertQuery = """
+  INSERT INTO "%[1]s" (dirhash, name, directory, meta)
+    VALUES($1, $2, $3, $4)
+    ON CONFLICT (dirhash, name) DO UPDATE SET
+      directory=EXCLUDED.directory,
+      meta=EXCLUDED.meta
+"""
 
-[cassandra]
+[cassandra2]
 # CREATE TABLE filemeta (
+#    dirhash bigint,
 #    directory varchar,
 #    name varchar,
 #    meta blob,
-#    PRIMARY KEY (directory, name)
+#    PRIMARY KEY ((dirhash, directory), name)
 # ) WITH CLUSTERING ORDER BY (name ASC);
 enabled = false
 keyspace = "seaweedfs"
@@ -166,6 +187,10 @@ enabled = false
 address = "localhost:6379"
 password = ""
 database = 0
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
@@ -176,6 +201,10 @@ masterName = "master"
 username = ""
 password = ""
 database = 0
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 
 [redis_cluster2]
 enabled = false
@@ -188,6 +217,10 @@ addresses = [
     "localhost:30006",
 ]
 password = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # allows reads from slave servers or the master, but all writes still go to the master
 readOnly = false
 # automatically use the closest Redis server for reads
@@ -195,11 +228,16 @@ routeByLatency = false
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
+# The following lua redis stores uses lua to ensure atomicity
 [redis_lua]
 enabled = false
 address = "localhost:6379"
 password = ""
 database = 0
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
@@ -210,6 +248,10 @@ masterName = "master"
 username = ""
 password = ""
 database = 0
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 
 [redis_lua_cluster]
 enabled = false
@@ -222,6 +264,10 @@ addresses = [
     "localhost:30006",
 ]
 password = ""
+enable_tls = false
+ca_cert_path = ""
+client_cert_path = ""
+client_key_path = ""
 # allows reads from slave servers or the master, but all writes still go to the master
 readOnly = false
 # automatically use the closest Redis server for reads
@@ -229,44 +275,30 @@ routeByLatency = false
 # This changes the data layout. Only add new directories. Removing/Updating will cause data loss.
 superLargeDirectories = []
 
-[redis3] # beta
-enabled = false
-address = "localhost:6379"
-password = ""
-database = 0
-
-[redis3_sentinel]
-enabled = false
-addresses = ["172.22.12.7:26379","172.22.12.8:26379","172.22.12.9:26379"]
-masterName = "master"
-username = ""
-password = ""
-database = 0
-
-[redis_cluster3] # beta
-enabled = false
-addresses = [
-    "localhost:30001",
-    "localhost:30002",
-    "localhost:30003",
-    "localhost:30004",
-    "localhost:30005",
-    "localhost:30006",
-]
-password = ""
-# allows reads from slave servers or the master, but all writes still go to the master
-readOnly = false
-# automatically use the closest Redis server for reads
-routeByLatency = false
-
 [etcd]
 enabled = false
 servers = "localhost:2379"
+username = ""
+password = ""
+key_prefix = "seaweedfs."
 timeout = "3s"
+# Set the CA certificate path
+tls_ca_file=""
+# Set the client certificate path
+tls_client_crt_file=""
+# Set the client private key path
+tls_client_key_file=""
 
 [mongodb]
 enabled = false
 uri = "mongodb://localhost:27017"
+username = ""
+password = ""
+ssl = false
+ssl_ca_file = ""
+ssl_cert_file = ""
+ssl_key_file = ""
+insecure_skip_verify = false
 option_pool_size = 0
 database = "seaweedfs"
 
@@ -313,7 +345,7 @@ dialTimeOut = 10
 ##########################
 # To add path-specific filer store:
 #
-# 1. Add a name following the store type separated by a dot ".". E.g., cassandra.tmp
+# 1. Add a name following the store type separated by a dot ".". E.g., cassandra2.tmp
 # 2. Add a location configuration. E.g., location = "/tmp/"
 # 3. Copy and customize all other configurations.
 #     Make sure they are not the same if using the same store type!
@@ -345,3 +377,10 @@ cert_path=""
 key_path=""
 # The name list used to verify the cn name
 verify_cn=""
+
+[tarantool]
+address = "localhost:3301"
+user = "guest"
+password = ""
+timeout = "5s"
+maxReconnects = 1000

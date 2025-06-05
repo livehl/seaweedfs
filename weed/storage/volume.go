@@ -43,22 +43,25 @@ type Volume struct {
 
 	lastCompactIndexOffset uint64
 	lastCompactRevision    uint16
+	ldbTimeout             int64
 
 	isCompacting       bool
 	isCommitCompacting bool
 
-	volumeInfo *volume_server_pb.VolumeInfo
-	location   *DiskLocation
+	volumeInfoRWLock sync.RWMutex
+	volumeInfo       *volume_server_pb.VolumeInfo
+	location         *DiskLocation
 
 	lastIoError error
 }
 
-func NewVolume(dirname string, dirIdx string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind, replicaPlacement *super_block.ReplicaPlacement, ttl *needle.TTL, preallocate int64, memoryMapMaxSizeMb uint32) (v *Volume, e error) {
+func NewVolume(dirname string, dirIdx string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind, replicaPlacement *super_block.ReplicaPlacement, ttl *needle.TTL, preallocate int64, memoryMapMaxSizeMb uint32, ldbTimeout int64) (v *Volume, e error) {
 	// if replicaPlacement is nil, the superblock will be loaded from disk
 	v = &Volume{dir: dirname, dirIdx: dirIdx, Collection: collection, Id: id, MemoryMapMaxSizeMb: memoryMapMaxSizeMb,
 		asyncRequestsChan: make(chan *needle.AsyncRequest, 128)}
 	v.SuperBlock = super_block.SuperBlock{ReplicaPlacement: replicaPlacement, Ttl: ttl}
 	v.needleMapKind = needleMapKind
+	v.ldbTimeout = ldbTimeout
 	e = v.load(true, true, needleMapKind, preallocate)
 	v.startWorker()
 	return
@@ -90,7 +93,7 @@ func (v *Volume) IndexFileName() (fileName string) {
 
 func (v *Volume) FileName(ext string) (fileName string) {
 	switch ext {
-	case ".idx", ".cpx", ".ldb":
+	case ".idx", ".cpx", ".ldb", ".cpldb":
 		return VolumeFileName(v.dirIdx, v.Collection, int(v.Id)) + ext
 	}
 	// .dat, .cpd, .vif
@@ -129,6 +132,29 @@ func (v *Volume) ContentSize() uint64 {
 		return 0
 	}
 	return v.nm.ContentSize()
+}
+
+func (v *Volume) doIsEmpty() (bool, error) {
+	// check v.DataBackend.GetStat()
+	if v.DataBackend == nil {
+		return false, fmt.Errorf("v.DataBackend is nil")
+	} else {
+		datFileSize, _, e := v.DataBackend.GetStat()
+		if e != nil {
+			glog.V(0).Infof("Failed to read file size %s %v", v.DataBackend.Name(), e)
+			return false, fmt.Errorf("v.DataBackend.GetStat(): %v", e)
+		}
+		if datFileSize > super_block.SuperBlockSize {
+			return false, nil
+		}
+	}
+	// check v.nm.ContentSize()
+	if v.nm != nil {
+		if v.nm.ContentSize() > 0 {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (v *Volume) DeletedSize() uint64 {
@@ -180,21 +206,6 @@ func (v *Volume) DiskType() types.DiskType {
 	return v.location.DiskType
 }
 
-func (v *Volume) SetStopping() {
-	v.dataFileAccessLock.Lock()
-	defer v.dataFileAccessLock.Unlock()
-	if v.nm != nil {
-		if err := v.nm.Sync(); err != nil {
-			glog.Warningf("Volume SetStopping fail to sync volume idx %d", v.Id)
-		}
-	}
-	if v.DataBackend != nil {
-		if err := v.DataBackend.Sync(); err != nil {
-			glog.Warningf("Volume SetStopping fail to sync volume %d", v.Id)
-		}
-	}
-}
-
 func (v *Volume) SyncToDisk() {
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
@@ -215,6 +226,10 @@ func (v *Volume) Close() {
 	v.dataFileAccessLock.Lock()
 	defer v.dataFileAccessLock.Unlock()
 
+	v.doClose()
+}
+
+func (v *Volume) doClose() {
 	for v.isCommitCompacting {
 		time.Sleep(521 * time.Millisecond)
 		glog.Warningf("Volume Close wait for compaction %d", v.Id)
@@ -228,12 +243,11 @@ func (v *Volume) Close() {
 		v.nm = nil
 	}
 	if v.DataBackend != nil {
-		if err := v.DataBackend.Sync(); err != nil {
+		if err := v.DataBackend.Close(); err != nil {
 			glog.Warningf("Volume Close fail to sync volume %d", v.Id)
 		}
-		_ = v.DataBackend.Close()
 		v.DataBackend = nil
-		stats.VolumeServerVolumeCounter.WithLabelValues(v.Collection, "volume").Dec()
+		stats.VolumeServerVolumeGauge.WithLabelValues(v.Collection, "volume").Dec()
 	}
 }
 
@@ -297,7 +311,6 @@ func (v *Volume) collectStatus() (maxFileKey types.NeedleId, datFileSize int64, 
 	fileCount = uint64(v.nm.FileCount())
 	deletedCount = uint64(v.nm.DeletedCount())
 	deletedSize = v.nm.DeletedSize()
-	fileCount = uint64(v.nm.FileCount())
 
 	return
 }
@@ -345,4 +358,11 @@ func (v *Volume) IsReadOnly() bool {
 	v.noWriteLock.RLock()
 	defer v.noWriteLock.RUnlock()
 	return v.noWriteOrDelete || v.noWriteCanDelete || v.location.isDiskSpaceLow
+}
+
+func (v *Volume) PersistReadOnly(readOnly bool) {
+	v.volumeInfoRWLock.RLock()
+	defer v.volumeInfoRWLock.RUnlock()
+	v.volumeInfo.ReadOnly = readOnly
+	v.SaveVolumeInfo()
 }

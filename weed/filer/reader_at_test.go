@@ -5,7 +5,6 @@ import (
 	"io"
 	"math"
 	"strconv"
-	"sync"
 	"testing"
 )
 
@@ -32,51 +31,57 @@ func (m *mockChunkCache) ReadChunkAt(data []byte, fileId string, offset uint64) 
 func (m *mockChunkCache) SetChunk(fileId string, data []byte) {
 }
 
+func (m *mockChunkCache) GetMaxFilePartSizeInCache() uint64 {
+	return 0
+}
+
+func (m *mockChunkCache) IsInCache(fileId string, lockNeeded bool) (answer bool) {
+	return false
+}
+
 func TestReaderAt(t *testing.T) {
 
-	visibles := []VisibleInterval{
-		{
-			start:     1,
-			stop:      2,
-			fileId:    "1",
-			chunkSize: 9,
-		},
-		{
-			start:     3,
-			stop:      4,
-			fileId:    "3",
-			chunkSize: 1,
-		},
-		{
-			start:     5,
-			stop:      6,
-			fileId:    "5",
-			chunkSize: 2,
-		},
-		{
-			start:     7,
-			stop:      9,
-			fileId:    "7",
-			chunkSize: 2,
-		},
-		{
-			start:     9,
-			stop:      10,
-			fileId:    "9",
-			chunkSize: 2,
-		},
-	}
+	visibles := NewIntervalList[*VisibleInterval]()
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     1,
+		stop:      2,
+		fileId:    "1",
+		chunkSize: 9,
+	})
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     3,
+		stop:      4,
+		fileId:    "3",
+		chunkSize: 1,
+	})
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     5,
+		stop:      6,
+		fileId:    "5",
+		chunkSize: 2,
+	})
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     7,
+		stop:      9,
+		fileId:    "7",
+		chunkSize: 2,
+	})
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     9,
+		stop:      10,
+		fileId:    "9",
+		chunkSize: 2,
+	})
 
 	readerAt := &ChunkReadAt{
 		chunkViews:    ViewFromVisibleIntervals(visibles, 0, math.MaxInt64),
-		readerLock:    sync.Mutex{},
 		fileSize:      10,
-		readerCache:   newReaderCache(3, &mockChunkCache{}, nil),
+		readerCache:   NewReaderCache(3, &mockChunkCache{}, nil),
 		readerPattern: NewReaderPattern(),
 	}
 
 	testReadAt(t, readerAt, 0, 10, 10, io.EOF, nil, nil)
-	testReadAt(t, readerAt, 0, 12, 12, io.EOF, nil, nil)
+	testReadAt(t, readerAt, 0, 12, 10, io.EOF, nil, nil)
 	testReadAt(t, readerAt, 2, 8, 8, io.EOF, nil, nil)
 	testReadAt(t, readerAt, 3, 6, 6, nil, nil, nil)
 
@@ -86,7 +91,7 @@ func testReadAt(t *testing.T, readerAt *ChunkReadAt, offset int64, size int, exp
 	if data == nil {
 		data = make([]byte, size)
 	}
-	n, err := readerAt.doReadAt(data, offset)
+	n, _, err := readerAt.doReadAt(data, offset)
 
 	if expectedN != n {
 		t.Errorf("unexpected read size: %d, expect: %d", n, expectedN)
@@ -101,26 +106,24 @@ func testReadAt(t *testing.T, readerAt *ChunkReadAt, offset int64, size int, exp
 
 func TestReaderAt0(t *testing.T) {
 
-	visibles := []VisibleInterval{
-		{
-			start:     2,
-			stop:      5,
-			fileId:    "1",
-			chunkSize: 9,
-		},
-		{
-			start:     7,
-			stop:      9,
-			fileId:    "2",
-			chunkSize: 9,
-		},
-	}
+	visibles := NewIntervalList[*VisibleInterval]()
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     2,
+		stop:      5,
+		fileId:    "1",
+		chunkSize: 9,
+	})
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     7,
+		stop:      9,
+		fileId:    "2",
+		chunkSize: 9,
+	})
 
 	readerAt := &ChunkReadAt{
 		chunkViews:    ViewFromVisibleIntervals(visibles, 0, math.MaxInt64),
-		readerLock:    sync.Mutex{},
 		fileSize:      10,
-		readerCache:   newReaderCache(3, &mockChunkCache{}, nil),
+		readerCache:   NewReaderCache(3, &mockChunkCache{}, nil),
 		readerPattern: NewReaderPattern(),
 	}
 
@@ -128,27 +131,25 @@ func TestReaderAt0(t *testing.T) {
 	testReadAt(t, readerAt, 3, 16, 7, io.EOF, nil, nil)
 	testReadAt(t, readerAt, 3, 5, 5, nil, nil, nil)
 
-	testReadAt(t, readerAt, 11, 5, 5, io.EOF, nil, nil)
-	testReadAt(t, readerAt, 10, 5, 5, io.EOF, nil, nil)
+	testReadAt(t, readerAt, 11, 5, 0, io.EOF, nil, nil)
+	testReadAt(t, readerAt, 10, 5, 0, io.EOF, nil, nil)
 
 }
 
 func TestReaderAt1(t *testing.T) {
 
-	visibles := []VisibleInterval{
-		{
-			start:     2,
-			stop:      5,
-			fileId:    "1",
-			chunkSize: 9,
-		},
-	}
+	visibles := NewIntervalList[*VisibleInterval]()
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     2,
+		stop:      5,
+		fileId:    "1",
+		chunkSize: 9,
+	})
 
 	readerAt := &ChunkReadAt{
 		chunkViews:    ViewFromVisibleIntervals(visibles, 0, math.MaxInt64),
-		readerLock:    sync.Mutex{},
 		fileSize:      20,
-		readerCache:   newReaderCache(3, &mockChunkCache{}, nil),
+		readerCache:   NewReaderCache(3, &mockChunkCache{}, nil),
 		readerPattern: NewReaderPattern(),
 	}
 
@@ -164,26 +165,24 @@ func TestReaderAt1(t *testing.T) {
 }
 
 func TestReaderAtGappedChunksDoNotLeak(t *testing.T) {
-	visibles := []VisibleInterval{
-		{
-			start:     2,
-			stop:      3,
-			fileId:    "1",
-			chunkSize: 5,
-		},
-		{
-			start:     7,
-			stop:      9,
-			fileId:    "1",
-			chunkSize: 4,
-		},
-	}
+	visibles := NewIntervalList[*VisibleInterval]()
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     2,
+		stop:      3,
+		fileId:    "1",
+		chunkSize: 5,
+	})
+	addVisibleInterval(visibles, &VisibleInterval{
+		start:     7,
+		stop:      9,
+		fileId:    "1",
+		chunkSize: 4,
+	})
 
 	readerAt := &ChunkReadAt{
 		chunkViews:    ViewFromVisibleIntervals(visibles, 0, math.MaxInt64),
-		readerLock:    sync.Mutex{},
 		fileSize:      9,
-		readerCache:   newReaderCache(3, &mockChunkCache{}, nil),
+		readerCache:   NewReaderCache(3, &mockChunkCache{}, nil),
 		readerPattern: NewReaderPattern(),
 	}
 
@@ -193,10 +192,9 @@ func TestReaderAtGappedChunksDoNotLeak(t *testing.T) {
 
 func TestReaderAtSparseFileDoesNotLeak(t *testing.T) {
 	readerAt := &ChunkReadAt{
-		chunkViews:    ViewFromVisibleIntervals([]VisibleInterval{}, 0, math.MaxInt64),
-		readerLock:    sync.Mutex{},
+		chunkViews:    ViewFromVisibleIntervals(NewIntervalList[*VisibleInterval](), 0, math.MaxInt64),
 		fileSize:      3,
-		readerCache:   newReaderCache(3, &mockChunkCache{}, nil),
+		readerCache:   NewReaderCache(3, &mockChunkCache{}, nil),
 		readerPattern: NewReaderPattern(),
 	}
 

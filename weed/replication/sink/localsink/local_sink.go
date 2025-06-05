@@ -1,6 +1,7 @@
 package localsink
 
 import (
+	"context"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -75,7 +76,7 @@ func (localsink *LocalSink) CreateEntry(key string, entry *filer_pb.Entry, signa
 	glog.V(4).Infof("Create Entry key: %s", key)
 
 	totalSize := filer.FileSize(entry)
-	chunkViews := filer.ViewFromChunks(localsink.filerSource.LookupFileId, entry.Chunks, 0, int64(totalSize))
+	chunkViews := filer.ViewFromChunks(context.Background(), localsink.filerSource.LookupFileId, entry.GetChunks(), 0, int64(totalSize))
 
 	dir := filepath.Dir(key)
 
@@ -90,11 +91,23 @@ func (localsink *LocalSink) CreateEntry(key string, entry *filer_pb.Entry, signa
 		return os.Mkdir(key, os.FileMode(entry.Attributes.FileMode))
 	}
 
-	dstFile, err := os.OpenFile(key, os.O_RDWR|os.O_CREATE|os.O_TRUNC, os.FileMode(entry.Attributes.FileMode))
+	mode := os.FileMode(entry.Attributes.FileMode)
+	dstFile, err := os.OpenFile(util.ToShortFileName(key), os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return err
 	}
 	defer dstFile.Close()
+
+	fi, err := dstFile.Stat()
+	if err != nil {
+		return err
+	}
+	if fi.Mode() != mode {
+		glog.V(4).Infof("Modify file mode: %o -> %o", fi.Mode(), mode)
+		if err := dstFile.Chmod(mode); err != nil {
+			return err
+		}
+	}
 
 	writeFunc := func(data []byte) error {
 		_, writeErr := dstFile.Write(data)

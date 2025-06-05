@@ -1,15 +1,18 @@
 package command
 
 import (
+	"context"
 	"fmt"
-	hashicorpRaft "github.com/hashicorp/raft"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"net/http"
 	"os"
 	"path"
 	"strings"
 	"time"
 
-	"golang.org/x/exp/slices"
+	hashicorpRaft "github.com/hashicorp/raft"
+
+	"slices"
 
 	"github.com/gorilla/mux"
 	"github.com/seaweedfs/raft/protobuf"
@@ -34,14 +37,15 @@ var (
 )
 
 type MasterOptions struct {
-	port              *int
-	portGrpc          *int
-	ip                *string
-	ipBind            *string
-	metaFolder        *string
-	peers             *string
-	volumeSizeLimitMB *uint
-	volumePreallocate *bool
+	port                       *int
+	portGrpc                   *int
+	ip                         *string
+	ipBind                     *string
+	metaFolder                 *string
+	peers                      *string
+	volumeSizeLimitMB          *uint
+	volumePreallocate          *bool
+	maxParallelVacuumPerServer *int
 	// pulseSeconds       *int
 	defaultReplication *string
 	garbageThreshold   *float64
@@ -51,6 +55,7 @@ type MasterOptions struct {
 	metricsIntervalSec *int
 	raftResumeState    *bool
 	metricsHttpPort    *int
+	metricsHttpIp      *string
 	heartbeatInterval  *time.Duration
 	electionTimeout    *time.Duration
 	raftHashicorp      *bool
@@ -67,6 +72,7 @@ func init() {
 	m.peers = cmdMaster.Flag.String("peers", "", "all master nodes in comma separated ip:port list, example: 127.0.0.1:9093,127.0.0.1:9094,127.0.0.1:9095")
 	m.volumeSizeLimitMB = cmdMaster.Flag.Uint("volumeSizeLimitMB", 30*1000, "Master stops directing writes to oversized volumes.")
 	m.volumePreallocate = cmdMaster.Flag.Bool("volumePreallocate", false, "Preallocate disk space for volumes.")
+	m.maxParallelVacuumPerServer = cmdMaster.Flag.Int("maxParallelVacuumPerServer", 1, "maximum number of volumes to vacuum in parallel per volume server")
 	// m.pulseSeconds = cmdMaster.Flag.Int("pulseSeconds", 5, "number of seconds between heartbeats")
 	m.defaultReplication = cmdMaster.Flag.String("defaultReplication", "", "Default replication type if not specified.")
 	m.garbageThreshold = cmdMaster.Flag.Float64("garbageThreshold", 0.3, "threshold to vacuum and reclaim spaces")
@@ -75,6 +81,7 @@ func init() {
 	m.metricsAddress = cmdMaster.Flag.String("metrics.address", "", "Prometheus gateway address <host>:<port>")
 	m.metricsIntervalSec = cmdMaster.Flag.Int("metrics.intervalSeconds", 15, "Prometheus push interval in seconds")
 	m.metricsHttpPort = cmdMaster.Flag.Int("metricsPort", 0, "Prometheus metrics listen port")
+	m.metricsHttpIp = cmdMaster.Flag.String("metricsIp", "", "metrics listen ip. If empty, default to same as -ip.bind option.")
 	m.raftResumeState = cmdMaster.Flag.Bool("resumeState", false, "resume previous state on start master server")
 	m.heartbeatInterval = cmdMaster.Flag.Duration("heartbeatInterval", 300*time.Millisecond, "heartbeat interval of master servers, and will be randomly multiplied by [1, 1.25)")
 	m.electionTimeout = cmdMaster.Flag.Duration("electionTimeout", 10*time.Second, "election timeout of master servers")
@@ -101,7 +108,7 @@ var (
 
 func runMaster(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	util.LoadConfiguration("master", false)
 
 	grace.SetupProfiling(*masterCpuProfile, *masterMemProfile)
@@ -119,9 +126,17 @@ func runMaster(cmd *Command, args []string) bool {
 		glog.Fatalf("volumeSizeLimitMB should be smaller than 30000")
 	}
 
-	go stats_collect.StartMetricsServer(*m.metricsHttpPort)
+	switch {
+	case *m.metricsHttpIp != "":
+		// noting to do, use m.metricsHttpIp
+	case *m.ipBind != "":
+		*m.metricsHttpIp = *m.ipBind
+	case *m.ip != "":
+		*m.metricsHttpIp = *m.ip
+	}
+	go stats_collect.StartMetricsServer(*m.metricsHttpIp, *m.metricsHttpPort)
+	go stats_collect.LoopPushingMetric("masterServer", util.JoinHostPort(*m.ip, *m.port), *m.metricsAddress, *m.metricsIntervalSec)
 	startMaster(m, masterWhiteList)
-
 	return true
 }
 
@@ -146,7 +161,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	r := mux.NewRouter()
 	ms := weed_server.NewMasterServer(r, masterOption.toMasterOption(masterWhiteList), masterPeers)
 	listeningAddress := util.JoinHostPort(*masterOption.ipBind, *masterOption.port)
-	glog.V(0).Infof("Start Seaweed Master %s at %s", util.Version(), listeningAddress)
+	glog.V(0).Infof("Start Seaweed Master %s at %s", version.Version(), listeningAddress)
 	masterListener, masterLocalListener, e := util.NewIpAndLocalListeners(*masterOption.ipBind, *masterOption.port, 0)
 	if e != nil {
 		glog.Fatalf("Master startup error: %v", e)
@@ -163,11 +178,11 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		RaftResumeState:   *masterOption.raftResumeState,
 		HeartbeatInterval: *masterOption.heartbeatInterval,
 		ElectionTimeout:   *masterOption.electionTimeout,
-		RaftBootstrap:     *m.raftBootstrap,
+		RaftBootstrap:     *masterOption.raftBootstrap,
 	}
 	var raftServer *weed_server.RaftServer
 	var err error
-	if *m.raftHashicorp {
+	if *masterOption.raftHashicorp {
 		if raftServer, err = weed_server.NewHashicorpRaftServer(raftServerOption); err != nil {
 			glog.Fatalf("NewHashicorpRaftServer: %s", err)
 		}
@@ -178,10 +193,10 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		}
 	}
 	ms.SetRaftServer(raftServer)
-	r.HandleFunc("/cluster/status", raftServer.StatusHandler).Methods("GET")
-	r.HandleFunc("/cluster/healthz", raftServer.HealthzHandler).Methods("GET", "HEAD")
-	if *m.raftHashicorp {
-		r.HandleFunc("/raft/stats", raftServer.StatsRaftHandler).Methods("GET")
+	r.HandleFunc("/cluster/status", raftServer.StatusHandler).Methods(http.MethodGet, http.MethodHead)
+	r.HandleFunc("/cluster/healthz", raftServer.HealthzHandler).Methods(http.MethodGet, http.MethodHead)
+	if *masterOption.raftHashicorp {
+		r.HandleFunc("/raft/stats", raftServer.StatsRaftHandler).Methods(http.MethodGet)
 	}
 	// starting grpc server
 	grpcPort := *masterOption.portGrpc
@@ -191,20 +206,20 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	}
 	grpcS := pb.NewGrpcServer(security.LoadServerTLS(util.GetViper(), "grpc.master"))
 	master_pb.RegisterSeaweedServer(grpcS, ms)
-	if *m.raftHashicorp {
+	if *masterOption.raftHashicorp {
 		raftServer.TransportManager.Register(grpcS)
 	} else {
 		protobuf.RegisterRaftServer(grpcS, raftServer)
 	}
 	reflection.Register(grpcS)
-	glog.V(0).Infof("Start Seaweed Master %s grpc server at %s:%d", util.Version(), *masterOption.ipBind, grpcPort)
+	glog.V(0).Infof("Start Seaweed Master %s grpc server at %s:%d", version.Version(), *masterOption.ipBind, grpcPort)
 	if grpcLocalL != nil {
 		go grpcS.Serve(grpcLocalL)
 	}
 	go grpcS.Serve(grpcL)
 
 	timeSleep := 1500 * time.Millisecond
-	if !*m.raftHashicorp {
+	if !*masterOption.raftHashicorp {
 		go func() {
 			time.Sleep(timeSleep)
 
@@ -217,7 +232,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 		}()
 	}
 
-	go ms.MasterClient.KeepConnectedToMaster()
+	go ms.MasterClient.KeepConnectedToMaster(context.Background())
 
 	// start http server
 	var (
@@ -255,7 +270,7 @@ func startMaster(masterOption MasterOptions, masterWhiteList []string) {
 	}
 
 	grace.OnInterrupt(ms.Shutdown)
-	grace.OnInterrupt(grpcS.GracefulStop)
+	grace.OnInterrupt(grpcS.Stop)
 	grace.OnReload(func() {
 		if ms.Topo.HashicorpRaft != nil && ms.Topo.HashicorpRaft.State() == hashicorpRaft.Leader {
 			ms.Topo.HashicorpRaft.LeadershipTransfer()
@@ -287,8 +302,8 @@ func checkPeers(masterIp string, masterPort int, masterGrpcPort int, peers strin
 }
 
 func isTheFirstOne(self pb.ServerAddress, peers []pb.ServerAddress) bool {
-	slices.SortFunc(peers, func(a, b pb.ServerAddress) bool {
-		return strings.Compare(string(a), string(b)) < 0
+	slices.SortFunc(peers, func(a, b pb.ServerAddress) int {
+		return strings.Compare(string(a), string(b))
 	})
 	if len(peers) <= 0 {
 		return true
@@ -299,10 +314,11 @@ func isTheFirstOne(self pb.ServerAddress, peers []pb.ServerAddress) bool {
 func (m *MasterOptions) toMasterOption(whiteList []string) *weed_server.MasterOption {
 	masterAddress := pb.NewServerAddress(*m.ip, *m.port, *m.portGrpc)
 	return &weed_server.MasterOption{
-		Master:            masterAddress,
-		MetaFolder:        *m.metaFolder,
-		VolumeSizeLimitMB: uint32(*m.volumeSizeLimitMB),
-		VolumePreallocate: *m.volumePreallocate,
+		Master:                     masterAddress,
+		MetaFolder:                 *m.metaFolder,
+		VolumeSizeLimitMB:          uint32(*m.volumeSizeLimitMB),
+		VolumePreallocate:          *m.volumePreallocate,
+		MaxParallelVacuumPerServer: *m.maxParallelVacuumPerServer,
 		// PulseSeconds:            *m.pulseSeconds,
 		DefaultReplicaPlacement: *m.defaultReplication,
 		GarbageThreshold:        *m.garbageThreshold,

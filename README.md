@@ -3,12 +3,12 @@
 
 [![Slack](https://img.shields.io/badge/slack-purple)](https://join.slack.com/t/seaweedfs/shared_invite/enQtMzI4MTMwMjU2MzA3LTEyYzZmZWYzOGQ3MDJlZWMzYmI0OTE4OTJiZjJjODBmMzUxNmYwODg0YjY3MTNlMjBmZDQ1NzQ5NDJhZWI2ZmY)
 [![Twitter](https://img.shields.io/twitter/follow/seaweedfs.svg?style=social&label=Follow)](https://twitter.com/intent/follow?screen_name=seaweedfs)
-[![Build Status](https://img.shields.io/github/workflow/status/chrislusf/seaweedfs/Go)](https://github.com/seaweedfs/seaweedfs/actions/workflows/go.yml)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/seaweedfs/seaweedfs/go.yml)](https://github.com/seaweedfs/seaweedfs/actions/workflows/go.yml)
 [![GoDoc](https://godoc.org/github.com/seaweedfs/seaweedfs/weed?status.svg)](https://godoc.org/github.com/seaweedfs/seaweedfs/weed)
 [![Wiki](https://img.shields.io/badge/docs-wiki-blue.svg)](https://github.com/seaweedfs/seaweedfs/wiki)
 [![Docker Pulls](https://img.shields.io/docker/pulls/chrislusf/seaweedfs?maxAge=4800)](https://hub.docker.com/r/chrislusf/seaweedfs/)
 [![SeaweedFS on Maven Central](https://img.shields.io/maven-central/v/com.github.chrislusf/seaweedfs-client)](https://search.maven.org/search?q=g:com.github.chrislusf)
-
+[![Artifact Hub](https://img.shields.io/endpoint?url=https://artifacthub.io/badge/repository/seaweedfs)](https://artifacthub.io/packages/search?repo=seaweedfs)
 
 ![SeaweedFS Logo](https://raw.githubusercontent.com/seaweedfs/seaweedfs/master/note/seaweedfs.png)
 
@@ -32,8 +32,9 @@ Your support will be really appreciated by me and other supporters!
 -->
 
 ### Gold Sponsors
-[![nodion](https://www.nodion.com/img/logo.svg)](https://www.nodion.com)
+[![nodion](https://raw.githubusercontent.com/seaweedfs/seaweedfs/master/note/sponsor_nodion.png)](https://www.nodion.com)
 [![piknik](https://raw.githubusercontent.com/seaweedfs/seaweedfs/master/note/piknik.png)](https://www.piknik.com)
+[![keepsec](https://raw.githubusercontent.com/seaweedfs/seaweedfs/master/note/keepsec.png)](https://www.keepsec.ca)
 
 ---
 
@@ -45,6 +46,7 @@ Your support will be really appreciated by me and other supporters!
 - [SeaweedFS Mailing List](https://groups.google.com/d/forum/seaweedfs)
 - [Wiki Documentation](https://github.com/seaweedfs/seaweedfs/wiki)
 - [SeaweedFS White Paper](https://github.com/seaweedfs/seaweedfs/wiki/SeaweedFS_Architecture.pdf)
+- [SeaweedFS Introduction Slides 2025.5](https://docs.google.com/presentation/d/1tdkp45J01oRV68dIm4yoTXKJDof-EhainlA0LMXexQE/edit?usp=sharing)
 - [SeaweedFS Introduction Slides 2021.5](https://docs.google.com/presentation/d/1DcxKWlINc-HNCjhYeERkpGXXm6nTCES8mi2W5G0Z4Ts/edit?usp=sharing)
 - [SeaweedFS Introduction Slides 2019.3](https://www.slideshare.net/chrislusf/seaweedfs-introduction)
 
@@ -66,6 +68,7 @@ Table of Contents
     * [Compared to GlusterFS, Ceph](#compared-to-glusterfs-ceph)
     * [Compared to GlusterFS](#compared-to-glusterfs)
     * [Compared to Ceph](#compared-to-ceph)
+    * [Compared to Minio](#compared-to-minio)
 * [Dev Plan](#dev-plan)
 * [Installation Guide](#installation-guide)
 * [Disk Related Topics](#disk-related-topics)
@@ -79,7 +82,7 @@ Table of Contents
 `docker run -p 8333:8333 chrislusf/seaweedfs server -s3`
 
 ## Quick Start with Single Binary ##
-* Download the latest binary from https://github.com/seaweedfs/seaweedfs/releases and unzip a single binary file `weed` or `weed.exe`
+* Download the latest binary from https://github.com/seaweedfs/seaweedfs/releases and unzip a single binary file `weed` or `weed.exe`. Or run `go install github.com/seaweedfs/seaweedfs/weed@latest`.
 * Run `weed server -dir=/some/data/dir -s3` to start one master, one volume server, one filer, and one S3 gateway.
 
 Also, to increase capacity, just add more volume servers by running `weed volume -dir="/some/data/dir2" -mserver="<master_host>:9333" -port=8081` locally, or on a different machine, or on thousands of machines. That is it!
@@ -120,7 +123,7 @@ SeaweedFS can transparently integrate with the cloud.
 With hot data on local cluster, and warm data on the cloud with O(1) access time, 
 SeaweedFS can achieve both fast local access time and elastic cloud storage capacity.
 What's more, the cloud storage access API cost is minimized. 
-Faster and Cheaper than direct cloud storage!
+Faster and cheaper than direct cloud storage!
 
 [Back to TOC](#table-of-contents)
 
@@ -131,7 +134,7 @@ Faster and Cheaper than direct cloud storage!
 * Automatic Gzip compression depending on file MIME type.
 * Automatic compaction to reclaim disk space after deletion or update.
 * [Automatic entry TTL expiration][VolumeServerTTL].
-* Any server with some disk spaces can add to the total storage space.
+* Any server with some disk space can add to the total storage space.
 * Adding/Removing servers does **not** cause any data re-balancing unless triggered by admin commands.
 * Optional picture resizing.
 * Support ETag, Accept-Range, Last-Modified, etc.
@@ -144,7 +147,7 @@ Faster and Cheaper than direct cloud storage!
 [Back to TOC](#table-of-contents)
 
 ## Filer Features ##
-* [Filer server][Filer] provides "normal" directories and files via http.
+* [Filer server][Filer] provides "normal" directories and files via HTTP.
 * [File TTL][FilerTTL] automatically expires file metadata and actual file data.
 * [Mount filer][Mount] reads and writes files directly as a local directory via FUSE.
 * [Filer Store Replication][FilerStoreReplication] enables HA for filer meta data stores.
@@ -373,7 +376,7 @@ Each individual file size is limited to the volume size.
 
 ### Saving memory ###
 
-All file meta information stored on an volume server is readable from memory without disk access. Each file takes just a 16-byte map entry of <64bit key, 32bit offset, 32bit size>. Of course, each map entry has its own space cost for the map. But usually the disk space runs out before the memory does.
+All file meta information stored on a volume server is readable from memory without disk access. Each file takes just a 16-byte map entry of <64bit key, 32bit offset, 32bit size>. Of course, each map entry has its own space cost for the map. But usually the disk space runs out before the memory does.
 
 ### Tiered Storage to the cloud ###
 
@@ -579,6 +582,71 @@ Percentage of the requests served within a certain time (ms)
    98%      0.6 ms
    99%      0.7 ms
   100%     54.1 ms
+```
+
+### Run WARP and launch a mixed benchmark. ###
+
+```
+make benchmark
+warp: Benchmark data written to "warp-mixed-2023-10-16[102354]-l70a.csv.zst"                                                                                                                                                                                               
+Mixed operations.
+Operation: DELETE, 10%, Concurrency: 20, Ran 4m59s.
+ * Throughput: 6.19 obj/s
+
+Operation: GET, 45%, Concurrency: 20, Ran 5m0s.
+ * Throughput: 279.85 MiB/s, 27.99 obj/s
+
+Operation: PUT, 15%, Concurrency: 20, Ran 5m0s.
+ * Throughput: 89.86 MiB/s, 8.99 obj/s
+
+Operation: STAT, 30%, Concurrency: 20, Ran 5m0s.
+ * Throughput: 18.63 obj/s
+
+Cluster Total: 369.74 MiB/s, 61.79 obj/s, 0 errors over 5m0s.
+```
+
+To see segmented request statistics, use the --analyze.v parameter.
+```
+warp analyze --analyze.v warp-mixed-2023-10-16[102354]-l70a.csv.zst
+18642 operations loaded... Done!
+Mixed operations.
+----------------------------------------
+Operation: DELETE - total: 1854, 10.0%, Concurrency: 20, Ran 5m0s, starting 2023-10-16 10:23:57.115 +0500 +05
+ * Throughput: 6.19 obj/s
+
+Requests considered: 1855:
+ * Avg: 104ms, 50%: 30ms, 90%: 207ms, 99%: 1.355s, Fastest: 1ms, Slowest: 4.613s, StdDev: 320ms
+
+----------------------------------------
+Operation: GET - total: 8388, 45.3%, Size: 10485760 bytes. Concurrency: 20, Ran 5m0s, starting 2023-10-16 10:23:57.12 +0500 +05
+ * Throughput: 279.77 MiB/s, 27.98 obj/s
+
+Requests considered: 8389:
+ * Avg: 221ms, 50%: 106ms, 90%: 492ms, 99%: 1.739s, Fastest: 8ms, Slowest: 8.633s, StdDev: 383ms
+ * TTFB: Avg: 81ms, Best: 2ms, 25th: 24ms, Median: 39ms, 75th: 65ms, 90th: 171ms, 99th: 669ms, Worst: 4.783s StdDev: 163ms
+ * First Access: Avg: 240ms, 50%: 105ms, 90%: 511ms, 99%: 2.08s, Fastest: 12ms, Slowest: 8.633s, StdDev: 480ms
+ * First Access TTFB: Avg: 88ms, Best: 2ms, 25th: 24ms, Median: 38ms, 75th: 64ms, 90th: 179ms, 99th: 919ms, Worst: 4.783s StdDev: 199ms
+ * Last Access: Avg: 219ms, 50%: 106ms, 90%: 463ms, 99%: 1.782s, Fastest: 9ms, Slowest: 8.633s, StdDev: 416ms
+ * Last Access TTFB: Avg: 81ms, Best: 2ms, 25th: 24ms, Median: 39ms, 75th: 65ms, 90th: 161ms, 99th: 657ms, Worst: 4.783s StdDev: 176ms
+
+----------------------------------------
+Operation: PUT - total: 2688, 14.5%, Size: 10485760 bytes. Concurrency: 20, Ran 5m0s, starting 2023-10-16 10:23:57.115 +0500 +05
+ * Throughput: 89.83 MiB/s, 8.98 obj/s
+
+Requests considered: 2689:
+ * Avg: 1.165s, 50%: 878ms, 90%: 2.015s, 99%: 5.74s, Fastest: 99ms, Slowest: 8.264s, StdDev: 968ms
+
+----------------------------------------
+Operation: STAT - total: 5586, 30.2%, Concurrency: 20, Ran 5m0s, starting 2023-10-16 10:23:57.113 +0500 +05
+ * Throughput: 18.63 obj/s
+
+Requests considered: 5587:
+ * Avg: 15ms, 50%: 11ms, 90%: 34ms, 99%: 80ms, Fastest: 0s, Slowest: 245ms, StdDev: 17ms
+ * First Access: Avg: 14ms, 50%: 10ms, 90%: 33ms, 99%: 69ms, Fastest: 0s, Slowest: 203ms, StdDev: 16ms
+ * Last Access: Avg: 15ms, 50%: 11ms, 90%: 34ms, 99%: 74ms, Fastest: 0s, Slowest: 203ms, StdDev: 17ms
+
+Cluster Total: 369.64 MiB/s, 61.77 obj/s, 0 errors over 5m0s.
+Total Errors:0.
 ```
 
 [Back to TOC](#table-of-contents)

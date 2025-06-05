@@ -2,6 +2,7 @@ package shell
 
 import (
 	"bytes"
+	"context"
 	"flag"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
@@ -27,6 +28,10 @@ func (c *commandS3BucketQuotaEnforce) Help() string {
 	Example:
 		s3.bucket.quota.enforce -apply
 `
+}
+
+func (c *commandS3BucketQuotaEnforce) HasTag(CommandTag) bool {
+	return false
 }
 
 func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
@@ -61,11 +66,11 @@ func (c *commandS3BucketQuotaEnforce) Do(args []string, commandEnv *CommandEnv, 
 
 	// process each bucket
 	hasConfChanges := false
-	err = filer_pb.List(commandEnv, filerBucketsPath, "", func(entry *filer_pb.Entry, isLast bool) error {
+	err = filer_pb.List(context.Background(), commandEnv, filerBucketsPath, "", func(entry *filer_pb.Entry, isLast bool) error {
 		if !entry.IsDirectory {
 			return nil
 		}
-		collection := entry.Name
+		collection := getCollectionName(commandEnv, entry.Name)
 		var collectionSize float64
 		if collectionInfo, found := collectionInfos[collection]; found {
 			collectionSize = collectionInfo.Size
@@ -130,7 +135,7 @@ func (c *commandS3BucketQuotaEnforce) processEachBucket(fc *filer.FilerConf, fil
 		} else {
 			fmt.Fprintf(writer, "    changing bucket %s to writable.\n", entry.Name)
 		}
-		fc.AddLocationConf(locConf)
+		fc.SetLocationConf(locConf)
 	}
 
 	return

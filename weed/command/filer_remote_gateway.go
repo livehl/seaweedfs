@@ -35,7 +35,7 @@ type RemoteGatewayOptions struct {
 var _ = filer_pb.FilerClient(&RemoteGatewayOptions{})
 
 func (option *RemoteGatewayOptions) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
-	return pb.WithFilerClient(streamingMode, pb.ServerAddress(*option.filerAddress), option.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	return pb.WithFilerClient(streamingMode, option.clientId, pb.ServerAddress(*option.filerAddress), option.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		return fn(client)
 	})
 }
@@ -71,14 +71,14 @@ var cmdFilerRemoteGateway = &Command{
 	filer.remote.gateway listens on filer local buckets update events. 
 	If any bucket is created, deleted, or updated, it will mirror the changes to remote object store.
 
-		weed filer.remote.sync -createBucketAt=cloud1
+		weed filer.remote.gateway -createBucketAt=cloud1
 
 `,
 }
 
 func runFilerRemoteGateway(cmd *Command, args []string) bool {
 
-	util.LoadConfiguration("security", false)
+	util.LoadSecurityConfiguration()
 	grpcDialOption := security.LoadClientTLS(util.GetViper(), "grpc.client")
 	remoteGatewayOptions.grpcDialOption = grpcDialOption
 
@@ -111,7 +111,7 @@ func runFilerRemoteGateway(cmd *Command, args []string) bool {
 
 	// synchronize /buckets folder
 	fmt.Printf("synchronize buckets in %s ...\n", remoteGatewayOptions.bucketsDir)
-	util.RetryForever("filer.remote.sync buckets", func() error {
+	util.RetryUntil("filer.remote.sync buckets", func() error {
 		return remoteGatewayOptions.followBucketUpdatesAndUploadToRemote(filerSource)
 	}, func(err error) bool {
 		if err != nil {

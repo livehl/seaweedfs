@@ -36,14 +36,14 @@ func (f *Filer) appendToFile(targetFile string, data []byte) error {
 	} else if err != nil {
 		return fmt.Errorf("find %s: %v", fullpath, err)
 	} else {
-		offset = int64(TotalSize(entry.Chunks))
+		offset = int64(TotalSize(entry.GetChunks()))
 	}
 
 	// append to existing chunks
-	entry.Chunks = append(entry.Chunks, uploadResult.ToPbFileChunk(assignResult.Fid, offset))
+	entry.Chunks = append(entry.GetChunks(), uploadResult.ToPbFileChunk(assignResult.Fid, offset, time.Now().UnixNano()))
 
 	// update the entry
-	err = f.CreateEntry(context.Background(), entry, false, false, nil, false)
+	err = f.CreateEntry(context.Background(), entry, false, false, nil, false, f.MaxFilenameLength)
 
 	return err
 }
@@ -58,7 +58,7 @@ func (f *Filer) assignAndUpload(targetFile string, data []byte) (*operation.Assi
 		WritableVolumeCount: rule.VolumeGrowthCount,
 	}
 
-	assignResult, err := operation.Assign(f.GetMaster, f.GrpcDialOption, assignRequest)
+	assignResult, err := operation.Assign(context.Background(), f.GetMaster, f.GrpcDialOption, assignRequest)
 	if err != nil {
 		return nil, nil, fmt.Errorf("AssignVolume: %v", err)
 	}
@@ -77,7 +77,13 @@ func (f *Filer) assignAndUpload(targetFile string, data []byte) (*operation.Assi
 		PairMap:           nil,
 		Jwt:               assignResult.Auth,
 	}
-	uploadResult, err := operation.UploadData(data, uploadOption)
+
+	uploader, err := operation.NewUploader()
+	if err != nil {
+		return nil, nil, fmt.Errorf("upload data %s: %v", targetUrl, err)
+	}
+
+	uploadResult, err := uploader.UploadData(context.Background(), data, uploadOption)
 	if err != nil {
 		return nil, nil, fmt.Errorf("upload data %s: %v", targetUrl, err)
 	}

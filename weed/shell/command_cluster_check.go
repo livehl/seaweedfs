@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"io"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
@@ -32,6 +33,10 @@ func (c *commandClusterCheck) Help() string {
 `
 }
 
+func (c *commandClusterCheck) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandClusterCheck) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	clusterPsCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -46,13 +51,13 @@ func (c *commandClusterCheck) Do(args []string, commandEnv *CommandEnv, writer i
 	}
 	fmt.Fprintf(writer, "Topology volumeSizeLimit:%d MB%s\n", volumeSizeLimitMb, diskInfosToString(topologyInfo.DiskInfos))
 
-	emptyDiskTypeDiskInfo, emptyDiskTypeFound := topologyInfo.DiskInfos[""]
-	hddDiskTypeDiskInfo, hddDiskTypeFound := topologyInfo.DiskInfos["hdd"]
-	if !emptyDiskTypeFound && !hddDiskTypeFound {
-		return fmt.Errorf("Need to a hdd disk type!")
+	if len(topologyInfo.DiskInfos) == 0 {
+		return fmt.Errorf("no disk type defined")
 	}
-	if emptyDiskTypeFound && emptyDiskTypeDiskInfo.MaxVolumeCount == 0 || hddDiskTypeFound && hddDiskTypeDiskInfo.MaxVolumeCount == 0 {
-		return fmt.Errorf("Need to a hdd disk type!")
+	for diskType, diskInfo := range topologyInfo.DiskInfos {
+		if diskInfo.MaxVolumeCount == 0 {
+			return fmt.Errorf("no volume available for \"%s\" disk type", diskType)
+		}
 	}
 
 	// collect filers
@@ -73,6 +78,19 @@ func (c *commandClusterCheck) Do(args []string, commandEnv *CommandEnv, writer i
 	}
 	fmt.Fprintf(writer, "the cluster has %d filers: %+v\n", len(filers), filers)
 
+	if len(filers) > 0 {
+		genericDiskInfo, genericDiskInfoOk := topologyInfo.DiskInfos[""]
+		hddDiskInfo, hddDiskInfoOk := topologyInfo.DiskInfos[types.HddType]
+
+		if !genericDiskInfoOk && !hddDiskInfoOk {
+			return fmt.Errorf("filer metadata logs need generic or hdd disk type to be defined")
+		}
+
+		if (genericDiskInfoOk && genericDiskInfo.MaxVolumeCount == 0) || (hddDiskInfoOk && hddDiskInfo.MaxVolumeCount == 0) {
+			return fmt.Errorf("filer metadata logs need generic or hdd volumes to be available")
+		}
+	}
+
 	// collect volume servers
 	var volumeServers []pb.ServerAddress
 	t, _, err := collectTopologyInfo(commandEnv, 0)
@@ -90,9 +108,7 @@ func (c *commandClusterCheck) Do(args []string, commandEnv *CommandEnv, writer i
 
 	// collect all masters
 	var masters []pb.ServerAddress
-	for _, master := range commandEnv.MasterClient.GetMasters() {
-		masters = append(masters, master)
-	}
+	masters = append(masters, commandEnv.MasterClient.GetMasters(context.Background())...)
 
 	// check from master to volume servers
 	for _, master := range masters {
@@ -161,7 +177,7 @@ func (c *commandClusterCheck) Do(args []string, commandEnv *CommandEnv, writer i
 	for _, filer := range filers {
 		for _, master := range masters {
 			fmt.Fprintf(writer, "checking filer %s to master %s ... ", string(filer), string(master))
-			err := pb.WithFilerClient(false, filer, commandEnv.option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+			err := pb.WithFilerClient(false, 0, filer, commandEnv.option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 				pong, err := client.Ping(context.Background(), &filer_pb.PingRequest{
 					Target:     string(master),
 					TargetType: cluster.MasterType,
@@ -181,7 +197,7 @@ func (c *commandClusterCheck) Do(args []string, commandEnv *CommandEnv, writer i
 	for _, filer := range filers {
 		for _, volumeServer := range volumeServers {
 			fmt.Fprintf(writer, "checking filer %s to volume server %s ... ", string(filer), string(volumeServer))
-			err := pb.WithFilerClient(false, filer, commandEnv.option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+			err := pb.WithFilerClient(false, 0, filer, commandEnv.option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 				pong, err := client.Ping(context.Background(), &filer_pb.PingRequest{
 					Target:     string(volumeServer),
 					TargetType: cluster.VolumeServerType,
@@ -224,7 +240,7 @@ func (c *commandClusterCheck) Do(args []string, commandEnv *CommandEnv, writer i
 	for _, sourceFiler := range filers {
 		for _, targetFiler := range filers {
 			fmt.Fprintf(writer, "checking filer %s to %s ... ", string(sourceFiler), string(targetFiler))
-			err := pb.WithFilerClient(false, sourceFiler, commandEnv.option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+			err := pb.WithFilerClient(false, 0, sourceFiler, commandEnv.option.GrpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 				pong, err := client.Ping(context.Background(), &filer_pb.PingRequest{
 					Target:     string(targetFiler),
 					TargetType: cluster.FilerType,

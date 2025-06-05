@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
-	"math/rand"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -108,7 +108,7 @@ func (locks *AdminLocks) generateToken(lockName string, clientName string) (ts t
 	locks.Lock()
 	defer locks.Unlock()
 	lock := &AdminLock{
-		accessSecret:   rand.Int63(),
+		accessSecret:   rand.Int64(),
 		accessLockTime: time.Now(),
 		lastClient:     clientName,
 	}
@@ -161,7 +161,7 @@ func (ms *MasterServer) Ping(ctx context.Context, req *master_pb.PingRequest) (r
 		StartTimeNs: time.Now().UnixNano(),
 	}
 	if req.TargetType == cluster.FilerType {
-		pingErr = pb.WithFilerClient(false, pb.ServerAddress(req.Target), ms.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		pingErr = pb.WithFilerClient(false, 0, pb.ServerAddress(req.Target), ms.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			pingResp, err := client.Ping(ctx, &filer_pb.PingRequest{})
 			if pingResp != nil {
 				resp.RemoteTimeNs = pingResp.StartTimeNs

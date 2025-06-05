@@ -36,8 +36,8 @@ func LoadCompactNeedleMap(file *os.File) (*NeedleMap, error) {
 func doLoading(file *os.File, nm *NeedleMap) (*NeedleMap, error) {
 	e := idx.WalkIndexFile(file, 0, func(key NeedleId, offset Offset, size Size) error {
 		nm.MaybeSetMaxFileKey(key)
-		nm.FileCounter++
 		if !offset.IsZero() && size.IsValid() {
+			nm.FileCounter++
 			nm.FileByteCounter = nm.FileByteCounter + uint64(size)
 			oldOffset, oldSize := nm.m.Set(NeedleId(key), offset, size)
 			if !oldOffset.IsZero() && oldSize.IsValid() {
@@ -51,7 +51,7 @@ func doLoading(file *os.File, nm *NeedleMap) (*NeedleMap, error) {
 		}
 		return nil
 	})
-	glog.V(1).Infof("max file key: %d for file: %s", nm.MaxFileKey(), file.Name())
+	glog.V(1).Infof("max file key: %v count: %d deleted: %d for file: %s", nm.MaxFileKey(), nm.FileCount(), nm.DeletedCount(), file.Name())
 	return nm, e
 }
 
@@ -84,7 +84,7 @@ func (nm *NeedleMap) Destroy() error {
 	return os.Remove(nm.indexFile.Name())
 }
 
-func (nm *NeedleMap) UpdateNeedleMap(v *Volume, indexFile *os.File, opts *opt.Options) error {
+func (nm *NeedleMap) UpdateNeedleMap(v *Volume, indexFile *os.File, opts *opt.Options, ldbTimeout int64) error {
 	if v.nm != nil {
 		v.nm.Close()
 		v.nm = nil
@@ -128,8 +128,4 @@ func (nm *NeedleMap) DoOffsetLoading(v *Volume, indexFile *os.File, startFrom ui
 	})
 
 	return e
-}
-
-func (m *NeedleMap) UpdateNeedleMapMetric(indexFile *os.File) error {
-	return nil
 }

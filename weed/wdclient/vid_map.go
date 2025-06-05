@@ -1,6 +1,7 @@
 package wdclient
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -21,7 +22,7 @@ type HasLookupFileIdFunction interface {
 	GetLookupFileIdFunction() LookupFileIdFunctionType
 }
 
-type LookupFileIdFunctionType func(fileId string) (targetUrls []string, err error)
+type LookupFileIdFunctionType func(ctx context.Context, fileId string) (targetUrls []string, err error)
 
 type Location struct {
 	Url        string `json:"url,omitempty"`
@@ -99,7 +100,7 @@ func (vc *vidMap) LookupVolumeServerUrl(vid string) (serverUrls []string, err er
 	return
 }
 
-func (vc *vidMap) LookupFileId(fileId string) (fullUrls []string, err error) {
+func (vc *vidMap) LookupFileId(ctx context.Context, fileId string) (fullUrls []string, err error) {
 	parts := strings.Split(fileId, ",")
 	if len(parts) != 2 {
 		return nil, errors.New("Invalid fileId " + fileId)
@@ -136,6 +137,19 @@ func (vc *vidMap) GetLocations(vid uint32) (locations []Location, found bool) {
 
 	if vc.cache != nil {
 		return vc.cache.GetLocations(vid)
+	}
+
+	return nil, false
+}
+
+func (vc *vidMap) GetLocationsClone(vid uint32) (locations []Location, found bool) {
+	locations, found = vc.GetLocations(vid)
+
+	if found {
+		// clone the locations in case the volume locations are changed below
+		existingLocations := make([]Location, len(locations))
+		copy(existingLocations, locations)
+		return existingLocations, found
 	}
 
 	return nil, false

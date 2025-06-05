@@ -16,7 +16,7 @@ var _ = filer_pb.FilerClient(&S3ApiServer{})
 
 func (s3a *S3ApiServer) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 
-	return pb.WithGrpcClient(streamingMode, func(grpcConnection *grpc.ClientConn) error {
+	return pb.WithGrpcClient(streamingMode, s3a.randomClientId, func(grpcConnection *grpc.ClientConn) error {
 		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
 	}, s3a.option.Filer.ToGrpcAddress(), false, s3a.option.GrpcDialOption)
@@ -38,6 +38,10 @@ func writeSuccessResponseXML(w http.ResponseWriter, r *http.Request, response in
 
 func writeSuccessResponseEmpty(w http.ResponseWriter, r *http.Request) {
 	s3err.WriteEmptyResponse(w, r, http.StatusOK)
+}
+
+func writeFailureResponse(w http.ResponseWriter, r *http.Request, errCode s3err.ErrorCode) {
+	s3err.WriteErrorResponse(w, r, errCode)
 }
 
 func validateContentMd5(h http.Header) ([]byte, error) {

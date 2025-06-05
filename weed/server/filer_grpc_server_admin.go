@@ -3,6 +3,7 @@ package weed_server
 import (
 	"context"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
@@ -11,7 +12,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
-	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 func (fs *FilerServer) Statistics(ctx context.Context, req *filer_pb.StatisticsRequest) (resp *filer_pb.StatisticsResponse, err error) {
@@ -49,7 +49,7 @@ func (fs *FilerServer) Ping(ctx context.Context, req *filer_pb.PingRequest) (res
 		StartTimeNs: time.Now().UnixNano(),
 	}
 	if req.TargetType == cluster.FilerType {
-		pingErr = pb.WithFilerClient(false, pb.ServerAddress(req.Target), fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		pingErr = pb.WithFilerClient(false, 0, pb.ServerAddress(req.Target), fs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			pingResp, err := client.Ping(ctx, &filer_pb.PingRequest{})
 			if pingResp != nil {
 				resp.RemoteTimeNs = pingResp.StartTimeNs
@@ -84,10 +84,8 @@ func (fs *FilerServer) Ping(ctx context.Context, req *filer_pb.PingRequest) (res
 
 func (fs *FilerServer) GetFilerConfiguration(ctx context.Context, req *filer_pb.GetFilerConfigurationRequest) (resp *filer_pb.GetFilerConfigurationResponse, err error) {
 
-	clusterId, _ := fs.filer.Store.KvGet(context.Background(), []byte("clusterId"))
-
 	t := &filer_pb.GetFilerConfigurationResponse{
-		Masters:            pb.ToAddressStringsFromMap(fs.option.Masters),
+		Masters:            fs.option.Masters.GetInstancesAsStrings(),
 		Collection:         fs.option.Collection,
 		Replication:        fs.option.DefaultReplication,
 		MaxMb:              uint32(fs.option.MaxMB),
@@ -96,9 +94,10 @@ func (fs *FilerServer) GetFilerConfiguration(ctx context.Context, req *filer_pb.
 		Signature:          fs.filer.Signature,
 		MetricsAddress:     fs.metricsAddress,
 		MetricsIntervalSec: int32(fs.metricsIntervalSec),
-		Version:            util.Version(),
-		ClusterId:          string(clusterId),
+		Version:            version.Version(),
 		FilerGroup:         fs.option.FilerGroup,
+		MajorVersion:       version.MAJOR_VERSION,
+		MinorVersion:       version.MINOR_VERSION,
 	}
 
 	glog.V(4).Infof("GetFilerConfiguration: %v", t)

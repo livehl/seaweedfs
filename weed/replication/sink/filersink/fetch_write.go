@@ -2,9 +2,11 @@ package filersink
 
 import (
 	"fmt"
-	"sync"
-
+	"github.com/schollz/progressbar/v3"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"os"
+	"path/filepath"
+	"sync"
 
 	"google.golang.org/grpc"
 
@@ -12,11 +14,26 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/operation"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	util_http "github.com/seaweedfs/seaweedfs/weed/util/http"
 )
 
 func (fs *FilerSink) replicateChunks(sourceChunks []*filer_pb.FileChunk, path string) (replicatedChunks []*filer_pb.FileChunk, err error) {
 	if len(sourceChunks) == 0 {
 		return
+	}
+
+	// a simple progress bar. Not ideal. Fix me.
+	var bar *progressbar.ProgressBar
+	if len(sourceChunks) > 1 {
+		name := filepath.Base(path)
+		bar = progressbar.NewOptions64(int64(len(sourceChunks)),
+			progressbar.OptionClearOnFinish(),
+			progressbar.OptionOnCompletion(func() {
+				fmt.Fprint(os.Stderr, "\n")
+			}),
+			progressbar.OptionFullWidth(),
+			progressbar.OptionSetDescription(name),
+		)
 	}
 
 	replicatedChunks = make([]*filer_pb.FileChunk, len(sourceChunks))
@@ -27,12 +44,19 @@ func (fs *FilerSink) replicateChunks(sourceChunks []*filer_pb.FileChunk, path st
 		index, source := chunkIndex, sourceChunk
 		fs.executor.Execute(func() {
 			defer wg.Done()
-			replicatedChunk, e := fs.replicateOneChunk(source, path)
-			if e != nil {
-				err = e
-				return
-			}
-			replicatedChunks[index] = replicatedChunk
+			util.Retry("replicate chunks", func() error {
+				replicatedChunk, e := fs.replicateOneChunk(source, path)
+				if e != nil {
+					err = e
+					return e
+				}
+				replicatedChunks[index] = replicatedChunk
+				if bar != nil {
+					bar.Add(1)
+				}
+				err = nil
+				return nil
+			})
 		})
 	}
 	wg.Wait()
@@ -51,7 +75,7 @@ func (fs *FilerSink) replicateOneChunk(sourceChunk *filer_pb.FileChunk, path str
 		FileId:       fileId,
 		Offset:       sourceChunk.Offset,
 		Size:         sourceChunk.Size,
-		Mtime:        sourceChunk.Mtime,
+		ModifiedTsNs: sourceChunk.ModifiedTsNs,
 		ETag:         sourceChunk.ETag,
 		SourceFileId: sourceChunk.GetFileIdString(),
 		CipherKey:    sourceChunk.CipherKey,
@@ -65,9 +89,15 @@ func (fs *FilerSink) fetchAndWrite(sourceChunk *filer_pb.FileChunk, path string)
 	if err != nil {
 		return "", fmt.Errorf("read part %s: %v", sourceChunk.GetFileIdString(), err)
 	}
-	defer util.CloseResponse(resp)
+	defer util_http.CloseResponse(resp)
 
-	fileId, uploadResult, err, _ := operation.UploadWithRetry(
+	uploader, err := operation.NewUploader()
+	if err != nil {
+		glog.V(0).Infof("upload source data %v: %v", sourceChunk.GetFileIdString(), err)
+		return "", fmt.Errorf("upload data: %v", err)
+	}
+
+	fileId, uploadResult, err, _ := uploader.UploadWithRetry(
 		fs,
 		&filer_pb.AssignVolumeRequest{
 			Count:       1,
@@ -112,7 +142,7 @@ var _ = filer_pb.FilerClient(&FilerSink{})
 
 func (fs *FilerSink) WithFilerClient(streamingMode bool, fn func(filer_pb.SeaweedFilerClient) error) error {
 
-	return pb.WithGrpcClient(streamingMode, func(grpcConnection *grpc.ClientConn) error {
+	return pb.WithGrpcClient(streamingMode, fs.signature, func(grpcConnection *grpc.ClientConn) error {
 		client := filer_pb.NewSeaweedFilerClient(grpcConnection)
 		return fn(client)
 	}, fs.grpcAddress, false, fs.grpcDialOption)

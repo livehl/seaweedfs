@@ -1,7 +1,8 @@
 package weed_server
 
 import (
-	"context"
+	"errors"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,29 +13,34 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-// listDirectoryHandler lists directories and folers under a directory
+// listDirectoryHandler lists directories and folders under a directory
 // files are sorted by name and paginated via "lastFileName" and "limit".
 // sub directories are listed on the first page, when "lastFileName"
 // is empty.
 func (fs *FilerServer) listDirectoryHandler(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if fs.option.ExposeDirectoryData == false {
+		writeJsonError(w, r, http.StatusForbidden, errors.New("ui is disabled"))
+		return
+	}
 
-	stats.FilerRequestCounter.WithLabelValues(stats.DirList).Inc()
+	stats.FilerHandlerCounter.WithLabelValues(stats.DirList).Inc()
 
 	path := r.URL.Path
 	if strings.HasSuffix(path, "/") && len(path) > 1 {
 		path = path[:len(path)-1]
 	}
 
-	limit, limit_err := strconv.Atoi(r.FormValue("limit"))
-	if limit_err != nil {
-		limit = 100
+	limit, limitErr := strconv.Atoi(r.FormValue("limit"))
+	if limitErr != nil {
+		limit = fs.option.DirListingLimit
 	}
 
 	lastFileName := r.FormValue("lastFileName")
 	namePattern := r.FormValue("namePattern")
 	namePatternExclude := r.FormValue("namePatternExclude")
 
-	entries, shouldDisplayLoadMore, err := fs.filer.ListDirectoryEntries(context.Background(), util.FullPath(path), lastFileName, false, int64(limit), "", namePattern, namePatternExclude)
+	entries, shouldDisplayLoadMore, err := fs.filer.ListDirectoryEntries(ctx, util.FullPath(path), lastFileName, false, int64(limit), "", namePattern, namePatternExclude)
 
 	if err != nil {
 		glog.V(0).Infof("listDirectory %s %s %d: %s", path, lastFileName, limit, err)
@@ -56,6 +62,7 @@ func (fs *FilerServer) listDirectoryHandler(w http.ResponseWriter, r *http.Reque
 
 	if r.Header.Get("Accept") == "application/json" {
 		writeJsonQuiet(w, r, http.StatusOK, struct {
+			Version               string
 			Path                  string
 			Entries               interface{}
 			Limit                 int
@@ -63,6 +70,7 @@ func (fs *FilerServer) listDirectoryHandler(w http.ResponseWriter, r *http.Reque
 			ShouldDisplayLoadMore bool
 			EmptyFolder           bool
 		}{
+			version.Version(),
 			path,
 			entries,
 			limit,
@@ -74,6 +82,7 @@ func (fs *FilerServer) listDirectoryHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	err = ui.StatusTpl.Execute(w, struct {
+		Version               string
 		Path                  string
 		Breadcrumbs           []ui.Breadcrumb
 		Entries               interface{}
@@ -83,6 +92,7 @@ func (fs *FilerServer) listDirectoryHandler(w http.ResponseWriter, r *http.Reque
 		EmptyFolder           bool
 		ShowDirectoryDelete   bool
 	}{
+		version.Version(),
 		path,
 		ui.ToBreadcrumb(path),
 		entries,
@@ -95,4 +105,5 @@ func (fs *FilerServer) listDirectoryHandler(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		glog.V(0).Infof("Template Execute Error: %v", err)
 	}
+
 }

@@ -31,7 +31,7 @@
         <dependency>
             <groupId>io.springfox</groupId>
             <artifactId>springfox-swagger-ui</artifactId>
-            <version>2.9.2</version>
+            <version>2.10.0</version>
         </dependency>
         <dependency>
             <groupId>org.apache.hadoop</groupId>
@@ -49,7 +49,7 @@
             <version>1.1.1</version>
         </dependency>
         <dependency>
-            <groupId>com.github.chrislusf</groupId>
+            <groupId>com.seaweedfs</groupId>
             <artifactId>seaweedfs-hadoop3-client</artifactId>
             <version>1.6.2</version>
         </dependency>

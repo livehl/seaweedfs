@@ -21,13 +21,13 @@ const REMOTE_STORAGE_CONF_SUFFIX = ".conf"
 const REMOTE_STORAGE_MOUNT_FILE = "mount.mapping"
 
 type FilerRemoteStorage struct {
-	rules             ptrie.Trie
+	rules             ptrie.Trie[*remote_pb.RemoteStorageLocation]
 	storageNameToConf map[string]*remote_pb.RemoteConf
 }
 
 func NewFilerRemoteStorage() (rs *FilerRemoteStorage) {
 	rs = &FilerRemoteStorage{
-		rules:             ptrie.New(),
+		rules:             ptrie.New[*remote_pb.RemoteStorageLocation](),
 		storageNameToConf: make(map[string]*remote_pb.RemoteConf),
 	}
 	return rs
@@ -82,9 +82,9 @@ func (rs *FilerRemoteStorage) mapDirectoryToRemoteStorage(dir util.FullPath, loc
 }
 
 func (rs *FilerRemoteStorage) FindMountDirectory(p util.FullPath) (mountDir util.FullPath, remoteLocation *remote_pb.RemoteStorageLocation) {
-	rs.rules.MatchPrefix([]byte(p), func(key []byte, value interface{}) bool {
+	rs.rules.MatchPrefix([]byte(p), func(key []byte, value *remote_pb.RemoteStorageLocation) bool {
 		mountDir = util.FullPath(string(key[:len(key)-1]))
-		remoteLocation = value.(*remote_pb.RemoteStorageLocation)
+		remoteLocation = value
 		return true
 	})
 	return
@@ -92,8 +92,8 @@ func (rs *FilerRemoteStorage) FindMountDirectory(p util.FullPath) (mountDir util
 
 func (rs *FilerRemoteStorage) FindRemoteStorageClient(p util.FullPath) (client remote_storage.RemoteStorageClient, remoteConf *remote_pb.RemoteConf, found bool) {
 	var storageLocation *remote_pb.RemoteStorageLocation
-	rs.rules.MatchPrefix([]byte(p), func(key []byte, value interface{}) bool {
-		storageLocation = value.(*remote_pb.RemoteStorageLocation)
+	rs.rules.MatchPrefix([]byte(p), func(key []byte, value *remote_pb.RemoteStorageLocation) bool {
+		storageLocation = value
 		return true
 	})
 
@@ -133,7 +133,7 @@ func UnmarshalRemoteStorageMappings(oldContent []byte) (mappings *remote_pb.Remo
 
 func ReadRemoteStorageConf(grpcDialOption grpc.DialOption, filerAddress pb.ServerAddress, storageName string) (conf *remote_pb.RemoteConf, readErr error) {
 	var oldContent []byte
-	if readErr = pb.WithFilerClient(false, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+	if readErr = pb.WithFilerClient(false, 0, filerAddress, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 		oldContent, readErr = ReadInsideFiler(client, DirectoryEtcRemote, storageName+REMOTE_STORAGE_CONF_SUFFIX)
 		return readErr
 	}); readErr != nil {

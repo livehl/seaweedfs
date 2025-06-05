@@ -29,6 +29,10 @@ func (c *commandVolumeDelete) Help() string {
 `
 }
 
+func (c *commandVolumeDelete) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandVolumeDelete) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	volDeleteCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -46,6 +50,6 @@ func (c *commandVolumeDelete) Do(args []string, commandEnv *CommandEnv, writer i
 
 	volumeId := needle.VolumeId(*volumeIdInt)
 
-	return deleteVolume(commandEnv.option.GrpcDialOption, volumeId, sourceVolumeServer)
+	return deleteVolume(commandEnv.option.GrpcDialOption, volumeId, sourceVolumeServer, false)
 
 }

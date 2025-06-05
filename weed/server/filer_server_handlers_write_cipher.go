@@ -19,7 +19,7 @@ import (
 // handling single chunk POST or PUT upload
 func (fs *FilerServer) encrypt(ctx context.Context, w http.ResponseWriter, r *http.Request, so *operation.StorageOption) (filerResult *FilerPostResult, err error) {
 
-	fileId, urlLocation, auth, err := fs.assignNewFileInfo(so)
+	fileId, urlLocation, auth, err := fs.assignNewFileInfo(ctx, so)
 
 	if err != nil || fileId == "" || urlLocation == "" {
 		return nil, fmt.Errorf("fail to allocate volume for %s, collection:%s, datacenter:%s", r.URL.Path, so.Collection, so.DataCenter)
@@ -53,13 +53,19 @@ func (fs *FilerServer) encrypt(ctx context.Context, w http.ResponseWriter, r *ht
 		PairMap:           pu.PairMap,
 		Jwt:               auth,
 	}
-	uploadResult, uploadError := operation.UploadData(uncompressedData, uploadOption)
+
+	uploader, uploaderErr := operation.NewUploader()
+	if uploaderErr != nil {
+		return nil, fmt.Errorf("uploader initialization error: %v", uploaderErr)
+	}
+
+	uploadResult, uploadError := uploader.UploadData(ctx, uncompressedData, uploadOption)
 	if uploadError != nil {
 		return nil, fmt.Errorf("upload to volume server: %v", uploadError)
 	}
 
 	// Save to chunk manifest structure
-	fileChunks := []*filer_pb.FileChunk{uploadResult.ToPbFileChunk(fileId, 0)}
+	fileChunks := []*filer_pb.FileChunk{uploadResult.ToPbFileChunk(fileId, 0, time.Now().UnixNano())}
 
 	// fmt.Printf("uploaded: %+v\n", uploadResult)
 
@@ -90,8 +96,8 @@ func (fs *FilerServer) encrypt(ctx context.Context, w http.ResponseWriter, r *ht
 		Size: int64(pu.OriginalDataSize),
 	}
 
-	if dbErr := fs.filer.CreateEntry(ctx, entry, false, false, nil, false); dbErr != nil {
-		fs.filer.DeleteChunks(entry.Chunks)
+	if dbErr := fs.filer.CreateEntry(ctx, entry, false, false, nil, false, so.MaxFileNameLength); dbErr != nil {
+		fs.filer.DeleteUncommittedChunks(ctx, entry.GetChunks())
 		err = dbErr
 		filerResult.Error = dbErr.Error()
 		return

@@ -157,6 +157,7 @@ message VacuumVolumeCommitRequest {
 }
 message VacuumVolumeCommitResponse {
     bool is_read_only = 1;
+    uint64 volume_size = 2;
 }
 
 message VacuumVolumeCleanupRequest {
@@ -218,12 +219,14 @@ message VolumeUnmountResponse {
 
 message VolumeDeleteRequest {
     uint32 volume_id = 1;
+    bool only_empty = 2;
 }
 message VolumeDeleteResponse {
 }
 
 message VolumeMarkReadonlyRequest {
     uint32 volume_id = 1;
+    bool persist = 2;
 }
 message VolumeMarkReadonlyResponse {
 }
@@ -247,6 +250,9 @@ message VolumeStatusRequest {
 }
 message VolumeStatusResponse {
     bool is_read_only = 1;
+    uint64 volume_size = 2;
+    uint64 file_count = 3;
+    uint64 file_deleted_count = 4;
 }
 
 message VolumeCopyRequest {
@@ -279,7 +285,6 @@ message CopyFileResponse {
 
 message ReadNeedleBlobRequest {
     uint32 volume_id = 1;
-    uint64 needle_id = 2;
     int64 offset = 3; // actual offset
     int32 size = 4;
 }
@@ -298,6 +303,7 @@ message ReadNeedleMetaResponse {
     uint64 last_modified = 2;
     uint32 crc = 3;
     string ttl = 4;
+    uint64 append_at_ns = 5;
 }
 
 message WriteNeedleBlobRequest {
@@ -317,6 +323,11 @@ message ReadAllNeedlesResponse {
     uint64 needle_id = 2;
     uint32 cookie = 3;
     bytes needle_blob = 5;
+    bool needle_blob_compressed = 6;
+    uint64 last_modified = 7;
+    uint32 crc = 8;
+    bytes name = 9;
+    bytes mime = 10;
 }
 
 message VolumeTailSenderRequest {
@@ -430,6 +441,7 @@ message ReadVolumeFileStatusResponse {
     uint32 compaction_revision = 7;
     string collection = 8;
     string disk_type = 9;
+    VolumeInfo volume_info = 10;
 }
 
 message DiskStatus {
@@ -466,6 +478,19 @@ message VolumeInfo {
     repeated RemoteFile files = 1;
     uint32 version = 2;
     string replication = 3;
+    uint32 bytes_offset = 4;
+    int64 dat_file_size = 5; // store the original dat file size
+    uint64 expire_at_sec = 6; // expiration time of ec volume
+    bool read_only = 7;
+}
+message OldVersionVolumeInfo {
+    repeated RemoteFile files = 1;
+    uint32 version = 2;
+    string replication = 3;
+    uint32 BytesOffset = 4;
+    int64 dat_file_size = 5; // store the original dat file size
+    uint64 DestroyTime = 6; // expiration time of ec volume
+    bool read_only = 7;
 }
 
 // tiered storage
@@ -525,6 +550,7 @@ message FetchAndWriteNeedleRequest {
     remote_pb.RemoteStorageLocation remote_location = 16;
 }
 message FetchAndWriteNeedleResponse {
+    string e_tag = 1;
 }
 
 // select on volume servers

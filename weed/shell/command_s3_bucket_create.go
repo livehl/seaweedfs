@@ -4,11 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3bucket"
 	"io"
 	"os"
 	"time"
-
-	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
 func init() {
@@ -30,6 +30,10 @@ func (c *commandS3BucketCreate) Help() string {
 `
 }
 
+func (c *commandS3BucketCreate) HasTag(CommandTag) bool {
+	return false
+}
+
 func (c *commandS3BucketCreate) Do(args []string, commandEnv *CommandEnv, writer io.Writer) (err error) {
 
 	bucketCommand := flag.NewFlagSet(c.Name(), flag.ContinueOnError)
@@ -40,6 +44,11 @@ func (c *commandS3BucketCreate) Do(args []string, commandEnv *CommandEnv, writer
 
 	if *bucketName == "" {
 		return fmt.Errorf("empty bucket name")
+	}
+
+	err = s3bucket.VerifyS3BucketName(*bucketName)
+	if err != nil {
+		return err
 	}
 
 	err = commandEnv.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
@@ -62,7 +71,7 @@ func (c *commandS3BucketCreate) Do(args []string, commandEnv *CommandEnv, writer
 			},
 		}
 
-		if err := filer_pb.CreateEntry(client, &filer_pb.CreateEntryRequest{
+		if err := filer_pb.CreateEntry(context.Background(), client, &filer_pb.CreateEntryRequest{
 			Directory: filerBucketsPath,
 			Entry:     entry,
 		}); err != nil {

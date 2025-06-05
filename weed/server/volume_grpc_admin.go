@@ -3,17 +3,17 @@ package weed_server
 import (
 	"context"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/storage"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"path/filepath"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/storage"
+
 	"github.com/seaweedfs/seaweedfs/weed/cluster"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
-	"github.com/seaweedfs/seaweedfs/weed/util"
-
-	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -50,6 +50,7 @@ func (vs *VolumeServer) AllocateVolume(ctx context.Context, req *volume_server_p
 		req.Preallocate,
 		req.MemoryMapMaxSizeMb,
 		types.ToDiskType(req.DiskType),
+		vs.ldbTimout,
 	)
 
 	if err != nil {
@@ -98,7 +99,7 @@ func (vs *VolumeServer) VolumeDelete(ctx context.Context, req *volume_server_pb.
 
 	resp := &volume_server_pb.VolumeDeleteResponse{}
 
-	err := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId))
+	err := vs.store.DeleteVolume(needle.VolumeId(req.VolumeId), req.OnlyEmpty)
 
 	if err != nil {
 		glog.Errorf("volume delete %v: %v", req, err)
@@ -162,7 +163,7 @@ func (vs *VolumeServer) VolumeMarkReadonly(ctx context.Context, req *volume_serv
 	// rare case 1.5: it will be unlucky if heartbeat happened between step 1 and 2.
 
 	// step 2: mark local volume as readonly
-	err := vs.store.MarkVolumeReadonly(needle.VolumeId(req.VolumeId))
+	err := vs.store.MarkVolumeReadonly(needle.VolumeId(req.VolumeId), req.GetPersist())
 
 	if err != nil {
 		glog.Errorf("volume mark readonly %v: %v", req, err)
@@ -179,7 +180,7 @@ func (vs *VolumeServer) VolumeMarkReadonly(ctx context.Context, req *volume_serv
 }
 
 func (vs *VolumeServer) notifyMasterVolumeReadonly(v *storage.Volume, isReadOnly bool) error {
-	if grpcErr := pb.WithMasterClient(false, vs.GetMaster(), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
+	if grpcErr := pb.WithMasterClient(false, vs.GetMaster(context.Background()), vs.grpcDialOption, false, func(client master_pb.SeaweedClient) error {
 		_, err := client.VolumeMarkReadonly(context.Background(), &master_pb.VolumeMarkReadonlyRequest{
 			Ip:               vs.store.Ip,
 			Port:             uint32(vs.store.Port),
@@ -195,8 +196,8 @@ func (vs *VolumeServer) notifyMasterVolumeReadonly(v *storage.Volume, isReadOnly
 		}
 		return nil
 	}); grpcErr != nil {
-		glog.V(0).Infof("connect to %s: %v", vs.GetMaster(), grpcErr)
-		return fmt.Errorf("grpc VolumeMarkReadonly with master %s: %v", vs.GetMaster(), grpcErr)
+		glog.V(0).Infof("connect to %s: %v", vs.GetMaster(context.Background()), grpcErr)
+		return fmt.Errorf("grpc VolumeMarkReadonly with master %s: %v", vs.GetMaster(context.Background()), grpcErr)
 	}
 	return nil
 }
@@ -234,8 +235,15 @@ func (vs *VolumeServer) VolumeStatus(ctx context.Context, req *volume_server_pb.
 	if v == nil {
 		return nil, fmt.Errorf("not found volume id %d", req.VolumeId)
 	}
+	if v.DataBackend == nil {
+		return nil, fmt.Errorf("volume %d data backend not found", req.VolumeId)
+	}
 
+	volumeSize, _, _ := v.DataBackend.GetStat()
 	resp.IsReadOnly = v.IsReadOnly()
+	resp.VolumeSize = uint64(volumeSize)
+	resp.FileCount = v.FileCount()
+	resp.FileDeletedCount = v.DeletedCount()
 
 	return resp, nil
 }
@@ -244,7 +252,7 @@ func (vs *VolumeServer) VolumeServerStatus(ctx context.Context, req *volume_serv
 
 	resp := &volume_server_pb.VolumeServerStatusResponse{
 		MemoryStatus: stats.MemStat(),
-		Version:      util.Version(),
+		Version:      version.Version(),
 		DataCenter:   vs.dataCenter,
 		Rack:         vs.rack,
 	}
@@ -315,7 +323,7 @@ func (vs *VolumeServer) Ping(ctx context.Context, req *volume_server_pb.PingRequ
 		StartTimeNs: time.Now().UnixNano(),
 	}
 	if req.TargetType == cluster.FilerType {
-		pingErr = pb.WithFilerClient(false, pb.ServerAddress(req.Target), vs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
+		pingErr = pb.WithFilerClient(false, 0, pb.ServerAddress(req.Target), vs.grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			pingResp, err := client.Ping(ctx, &filer_pb.PingRequest{})
 			if pingResp != nil {
 				resp.RemoteTimeNs = pingResp.StartTimeNs
