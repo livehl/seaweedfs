@@ -187,7 +187,7 @@ func (store *MongodbStore) FindEntry(ctx context.Context, fullpath util.FullPath
 	var where = bson.M{"directory": dir, "name": name}
 	err = store.connect.Database(store.database).Collection(store.collectionName).FindOne(ctx, where).Decode(&data)
 	if err != mongo.ErrNoDocuments && err != nil {
-		glog.Errorf("find %s: %v", fullpath, err)
+		glog.ErrorfCtx(ctx, "find %s: %v", fullpath, err)
 		return nil, filer_pb.ErrNotFound
 	}
 
@@ -234,16 +234,24 @@ func (store *MongodbStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 		"directory": string(dirPath),
 	}
 
+	nameQuery := bson.M{}
+
 	if len(prefix) > 0 {
-		where["name"].(bson.M)["$regex"] = "^" + regexp.QuoteMeta(prefix)
+		nameQuery["$regex"] = "^" + regexp.QuoteMeta(prefix)
 	}
 
-	if includeStartFile {
-		where["name"].(bson.M)["$gte"] = startFileName
-	} else {
-		where["name"].(bson.M)["$gt"] = startFileName
+	if len(startFileName) > 0 {
+		if includeStartFile {
+			nameQuery["$gte"] = startFileName
+		} else {
+			nameQuery["$gt"] = startFileName
+		}
 	}
-		
+
+	if len(nameQuery) > 0 {
+		where["name"] = nameQuery
+	}
+
 	optLimit := int64(limit)
 	opts := &options.FindOptions{Limit: &optLimit, Sort: bson.M{"name": 1}}
 	cur, err := store.connect.Database(store.database).Collection(store.collectionName).Find(ctx, where, opts)
@@ -264,7 +272,7 @@ func (store *MongodbStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 		lastFileName = data.Name
 		if decodeErr := entry.DecodeAttributesAndChunks(util.MaybeDecompressData(data.Meta)); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
 
@@ -275,7 +283,7 @@ func (store *MongodbStore) ListDirectoryPrefixedEntries(ctx context.Context, dir
 	}
 
 	if err := cur.Close(ctx); err != nil {
-		glog.V(0).Infof("list iterator close: %v", err)
+		glog.V(0).InfofCtx(ctx, "list iterator close: %v", err)
 	}
 
 	return lastFileName, err

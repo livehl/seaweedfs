@@ -106,7 +106,7 @@ func ResolveOneChunkManifest(ctx context.Context, lookupFileIdFn wdclient.Lookup
 func fetchWholeChunk(ctx context.Context, bytesBuffer *bytes.Buffer, lookupFileIdFn wdclient.LookupFileIdFunctionType, fileId string, cipherKey []byte, isGzipped bool) error {
 	urlStrings, err := lookupFileIdFn(ctx, fileId)
 	if err != nil {
-		glog.Errorf("operation LookupFileId %s failed, err: %v", fileId, err)
+		glog.ErrorfCtx(ctx, "operation LookupFileId %s failed, err: %v", fileId, err)
 		return err
 	}
 	err = retriedStreamFetchChunkData(ctx, bytesBuffer, urlStrings, "", cipherKey, isGzipped, true, 0, 0)
@@ -116,13 +116,13 @@ func fetchWholeChunk(ctx context.Context, bytesBuffer *bytes.Buffer, lookupFileI
 	return nil
 }
 
-func fetchChunkRange(buffer []byte, lookupFileIdFn wdclient.LookupFileIdFunctionType, fileId string, cipherKey []byte, isGzipped bool, offset int64) (int, error) {
-	urlStrings, err := lookupFileIdFn(context.Background(), fileId)
+func fetchChunkRange(ctx context.Context, buffer []byte, lookupFileIdFn wdclient.LookupFileIdFunctionType, fileId string, cipherKey []byte, isGzipped bool, offset int64) (int, error) {
+	urlStrings, err := lookupFileIdFn(ctx, fileId)
 	if err != nil {
-		glog.Errorf("operation LookupFileId %s failed, err: %v", fileId, err)
+		glog.ErrorfCtx(ctx, "operation LookupFileId %s failed, err: %v", fileId, err)
 		return 0, err
 	}
-	return util_http.RetriedFetchChunkData(context.Background(), buffer, urlStrings, cipherKey, isGzipped, false, offset)
+	return util_http.RetriedFetchChunkData(ctx, buffer, urlStrings, cipherKey, isGzipped, false, offset, fileId)
 }
 
 func retriedStreamFetchChunkData(ctx context.Context, writer io.Writer, urlStrings []string, jwt string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, size int) (err error) {
@@ -131,12 +131,34 @@ func retriedStreamFetchChunkData(ctx context.Context, writer io.Writer, urlStrin
 	var totalWritten int
 
 	for waitTime := time.Second; waitTime < util.RetryWaitTime; waitTime += waitTime / 2 {
+		// Check for context cancellation before starting retry loop
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		retriedCnt := 0
 		for _, urlString := range urlStrings {
+			// Check for context cancellation before each volume server request
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+
 			retriedCnt++
 			var localProcessed int
 			var writeErr error
 			shouldRetry, err = util_http.ReadUrlAsStreamAuthenticated(ctx, urlString+"?readDeleted=true", jwt, cipherKey, isGzipped, isFullChunk, offset, size, func(data []byte) {
+				// Check for context cancellation during data processing
+				select {
+				case <-ctx.Done():
+					writeErr = ctx.Err()
+					return
+				default:
+				}
+
 				if totalWritten > localProcessed {
 					toBeSkipped := totalWritten - localProcessed
 					if len(data) <= toBeSkipped {
@@ -159,7 +181,7 @@ func retriedStreamFetchChunkData(ctx context.Context, writer io.Writer, urlStrin
 				break
 			}
 			if err != nil {
-				glog.V(0).Infof("read %s failed, err: %v", urlString, err)
+				glog.V(0).InfofCtx(ctx, "read %s failed, err: %v", urlString, err)
 			} else {
 				break
 			}
@@ -169,8 +191,16 @@ func retriedStreamFetchChunkData(ctx context.Context, writer io.Writer, urlStrin
 			break
 		}
 		if err != nil && shouldRetry {
-			glog.V(0).Infof("retry reading in %v", waitTime)
-			time.Sleep(waitTime)
+			glog.V(0).InfofCtx(ctx, "retry reading in %v", waitTime)
+			// Sleep with proper context cancellation and timer cleanup
+			timer := time.NewTimer(waitTime)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+				// Continue with retry
+			}
 		} else {
 			break
 		}
@@ -181,6 +211,12 @@ func retriedStreamFetchChunkData(ctx context.Context, writer io.Writer, urlStrin
 }
 
 func MaybeManifestize(saveFunc SaveDataAsChunkFunctionType, inputChunks []*filer_pb.FileChunk) (chunks []*filer_pb.FileChunk, err error) {
+	// Don't manifestize SSE-encrypted chunks to preserve per-chunk metadata
+	for _, chunk := range inputChunks {
+		if chunk.GetSseType() != 0 { // Any SSE type (SSE-C or SSE-KMS)
+			return inputChunks, nil
+		}
+	}
 	return doMaybeManifestize(saveFunc, inputChunks, ManifestBatch, mergeIntoManifest)
 }
 
@@ -220,7 +256,7 @@ func mergeIntoManifest(saveFunc SaveDataAsChunkFunctionType, dataChunks []*filer
 		Chunks: dataChunks,
 	})
 	if serErr != nil {
-		return nil, fmt.Errorf("serializing manifest: %v", serErr)
+		return nil, fmt.Errorf("serializing manifest: %w", serErr)
 	}
 
 	minOffset, maxOffset := int64(math.MaxInt64), int64(math.MinInt64)

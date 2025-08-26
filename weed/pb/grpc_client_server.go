@@ -3,14 +3,16 @@ package pb
 import (
 	"context"
 	"fmt"
-	"github.com/google/uuid"
-	"google.golang.org/grpc/metadata"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
+	"google.golang.org/grpc/metadata"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
@@ -22,6 +24,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/mq_pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/worker_pb"
 )
 
 const (
@@ -128,7 +131,7 @@ func requestIDUnaryInterceptor() grpc.UnaryServerInterceptor {
 		handler grpc.UnaryHandler,
 	) (interface{}, error) {
 		incomingMd, _ := metadata.FromIncomingContext(ctx)
-		idList := incomingMd.Get(util.RequestIDKey)
+		idList := incomingMd.Get(request_id.AmzRequestIDHeader)
 		var reqID string
 		if len(idList) > 0 {
 			reqID = idList[0]
@@ -139,11 +142,12 @@ func requestIDUnaryInterceptor() grpc.UnaryServerInterceptor {
 
 		ctx = metadata.NewOutgoingContext(ctx,
 			metadata.New(map[string]string{
-				util.RequestIDKey: reqID,
+				request_id.AmzRequestIDHeader: reqID,
 			}))
 
-		ctx = util.WithRequestID(ctx, reqID)
-		grpc.SetTrailer(ctx, metadata.Pairs(util.RequestIDKey, reqID))
+		ctx = request_id.Set(ctx, reqID)
+
+		grpc.SetTrailer(ctx, metadata.Pairs(request_id.AmzRequestIDHeader, reqID))
 
 		return handler(ctx, req)
 	}
@@ -196,7 +200,7 @@ func ParseServerAddress(server string, deltaPort int) (newServerAddress string, 
 
 	host, port, parseErr := hostAndPort(server)
 	if parseErr != nil {
-		return "", fmt.Errorf("server port parse error: %v", parseErr)
+		return "", fmt.Errorf("server port parse error: %w", parseErr)
 	}
 
 	newPort := int(port) + deltaPort
@@ -211,7 +215,7 @@ func hostAndPort(address string) (host string, port uint64, err error) {
 	}
 	port, err = strconv.ParseUint(address[colonIndex+1:], 10, 64)
 	if err != nil {
-		return "", 0, fmt.Errorf("server port parse error: %v", err)
+		return "", 0, fmt.Errorf("server port parse error: %w", err)
 	}
 
 	return address[:colonIndex], port, err
@@ -308,4 +312,11 @@ func WithOneOfGrpcFilerClients(streamingMode bool, filerAddresses []ServerAddres
 	}
 
 	return err
+}
+
+func WithWorkerClient(streamingMode bool, workerAddress string, grpcDialOption grpc.DialOption, fn func(client worker_pb.WorkerServiceClient) error) error {
+	return WithGrpcClient(streamingMode, 0, func(grpcConnection *grpc.ClientConn) error {
+		client := worker_pb.NewWorkerServiceClient(grpcConnection)
+		return fn(client)
+	}, workerAddress, false, grpcDialOption)
 }

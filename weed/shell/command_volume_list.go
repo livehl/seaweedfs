@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"flag"
 	"fmt"
+	"path/filepath"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/erasure_coding"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
-	"path/filepath"
-	"slices"
-	"strings"
-	"time"
+	"github.com/seaweedfs/seaweedfs/weed/util"
 
 	"io"
 )
@@ -73,9 +76,34 @@ func (c *commandVolumeList) Do(args []string, commandEnv *CommandEnv, writer io.
 	return nil
 }
 
+func sortMapKey[T1 comparable, T2 any](m map[T1]T2) []T1 {
+	keys := make([]T1, 0, len(m))
+	for k, _ := range m {
+		keys = append(keys, k)
+	}
+
+	sort.Slice(keys, func(i, j int) bool {
+		switch v1 := any(keys[i]).(type) {
+		case int:
+			return v1 < any(keys[j]).(int)
+		case string:
+			if strings.Compare(v1, any(keys[j]).(string)) < 0 {
+				return true
+			}
+			return false
+		default:
+			return false
+		}
+	})
+	return keys
+}
+
 func diskInfosToString(diskInfos map[string]*master_pb.DiskInfo) string {
 	var buf bytes.Buffer
-	for diskType, diskInfo := range diskInfos {
+
+	for _, diskType := range sortMapKey(diskInfos) {
+		diskInfo := diskInfos[diskType]
+
 		if diskType == "" {
 			diskType = types.HddType
 		}
@@ -152,7 +180,8 @@ func (c *commandVolumeList) writeRackInfo(writer io.Writer, t *master_pb.RackInf
 func (c *commandVolumeList) writeDataNodeInfo(writer io.Writer, t *master_pb.DataNodeInfo, verbosityLevel int, outRackInfo func()) statistics {
 	var s statistics
 	diskInfoFound := false
-	for _, diskInfo := range t.DiskInfos {
+	for _, diskType := range sortMapKey(t.DiskInfos) {
+		diskInfo := t.DiskInfos[diskType]
 		s = s.plus(c.writeDiskInfo(writer, diskInfo, verbosityLevel, func() {
 			outRackInfo()
 			output(verbosityLevel >= 3, writer, "      DataNode %s%s\n", t.Id, diskInfosToString(t.DiskInfos))
@@ -193,13 +222,14 @@ func (c *commandVolumeList) writeDiskInfo(writer io.Writer, t *master_pb.DiskInf
 		return int(a.Id) - int(b.Id)
 	})
 	volumeInfosFound := false
+
 	for _, vi := range t.VolumeInfos {
 		if c.isNotMatchDiskInfo(vi.ReadOnly, vi.Collection, vi.Id, int64(vi.Size)) {
 			continue
 		}
 		if !volumeInfosFound {
 			outNodeInfo()
-			output(verbosityLevel >= 4, writer, "        Disk %s(%s)\n", diskType, diskInfoToString(t))
+			output(verbosityLevel >= 4, writer, "        Disk %s(%s) id:%d\n", diskType, diskInfoToString(t), t.DiskId)
 			volumeInfosFound = true
 		}
 		s = s.plus(writeVolumeInformationMessage(writer, vi, verbosityLevel))
@@ -211,7 +241,7 @@ func (c *commandVolumeList) writeDiskInfo(writer io.Writer, t *master_pb.DiskInf
 		}
 		if !volumeInfosFound && !ecShardInfoFound {
 			outNodeInfo()
-			output(verbosityLevel >= 4, writer, "        Disk %s(%s)\n", diskType, diskInfoToString(t))
+			output(verbosityLevel >= 4, writer, "        Disk %s(%s) id:%d\n", diskType, diskInfoToString(t), t.DiskId)
 			ecShardInfoFound = true
 		}
 		var expireAtString string
@@ -219,7 +249,27 @@ func (c *commandVolumeList) writeDiskInfo(writer io.Writer, t *master_pb.DiskInf
 		if destroyTime > 0 {
 			expireAtString = fmt.Sprintf("expireAt:%s", time.Unix(int64(destroyTime), 0).Format("2006-01-02 15:04:05"))
 		}
-		output(verbosityLevel >= 5, writer, "          ec volume id:%v collection:%v shards:%v %s\n", ecShardInfo.Id, ecShardInfo.Collection, erasure_coding.ShardBits(ecShardInfo.EcIndexBits).ShardIds(), expireAtString)
+
+		// Build shard size information
+		shardIds := erasure_coding.ShardBits(ecShardInfo.EcIndexBits).ShardIds()
+		var totalSize int64
+		var shardSizeInfo string
+
+		if len(ecShardInfo.ShardSizes) > 0 {
+			var shardDetails []string
+			for _, shardId := range shardIds {
+				if size, found := erasure_coding.GetShardSize(ecShardInfo, erasure_coding.ShardId(shardId)); found {
+					shardDetails = append(shardDetails, fmt.Sprintf("%d:%s", shardId, util.BytesToHumanReadable(uint64(size))))
+					totalSize += size
+				} else {
+					shardDetails = append(shardDetails, fmt.Sprintf("%d:?", shardId))
+				}
+			}
+			shardSizeInfo = fmt.Sprintf(" sizes:[%s] total:%s", strings.Join(shardDetails, " "), util.BytesToHumanReadable(uint64(totalSize)))
+		}
+
+		output(verbosityLevel >= 5, writer, "          ec volume id:%v collection:%v shards:%v%s %s\n",
+			ecShardInfo.Id, ecShardInfo.Collection, shardIds, shardSizeInfo, expireAtString)
 	}
 	output((volumeInfosFound || ecShardInfoFound) && verbosityLevel >= 4, writer, "        Disk %s %+v \n", diskType, s)
 	return s

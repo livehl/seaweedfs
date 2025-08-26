@@ -1,12 +1,11 @@
-//go:build linux || darwin
-// +build linux darwin
+//go:build linux || darwin || freebsd
+// +build linux darwin freebsd
 
 package command
 
 import (
 	"context"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +15,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -77,7 +78,7 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		err = pb.WithOneOfGrpcFilerClients(false, filerAddresses, grpcDialOption, func(client filer_pb.SeaweedFilerClient) error {
 			resp, err := client.GetFilerConfiguration(context.Background(), &filer_pb.GetFilerConfigurationRequest{})
 			if err != nil {
-				return fmt.Errorf("get filer grpc address %v configuration: %v", filerAddresses, err)
+				return fmt.Errorf("get filer grpc address %v configuration: %w", filerAddresses, err)
 			}
 			cipher = resp.Cipher
 			return nil
@@ -252,6 +253,13 @@ func RunMount(option *MountOptions, umask os.FileMode) bool {
 		UidGidMapper:       uidGidMapper,
 		DisableXAttr:       *option.disableXAttr,
 		IsMacOs:            runtime.GOOS == "darwin",
+		// RDMA acceleration options
+		RdmaEnabled:       *option.rdmaEnabled,
+		RdmaSidecarAddr:   *option.rdmaSidecarAddr,
+		RdmaFallback:      *option.rdmaFallback,
+		RdmaReadOnly:      *option.rdmaReadOnly,
+		RdmaMaxConcurrent: *option.rdmaMaxConcurrent,
+		RdmaTimeoutMs:     *option.rdmaTimeoutMs,
 	})
 
 	// create mount root

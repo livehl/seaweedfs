@@ -3,8 +3,8 @@ package command
 import (
 	"context"
 	"fmt"
+
 	"github.com/seaweedfs/seaweedfs/weed/util/version"
-	"net/http"
 
 	"time"
 
@@ -15,6 +15,11 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/security"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+
+	// Import credential stores to register them
+	_ "github.com/seaweedfs/seaweedfs/weed/credential/filer_etc"
+	_ "github.com/seaweedfs/seaweedfs/weed/credential/memory"
+	_ "github.com/seaweedfs/seaweedfs/weed/credential/postgres"
 )
 
 var (
@@ -82,8 +87,6 @@ func (iamopt *IamOptions) startIamServer() bool {
 		glog.Fatalf("IAM API Server startup error: %v", iamApiServer_err)
 	}
 
-	httpS := &http.Server{Handler: router}
-
 	listenAddress := fmt.Sprintf(":%d", *iamopt.port)
 	iamApiListener, iamApiLocalListener, err := util.NewIpAndLocalListeners(*iamopt.ip, *iamopt.port, time.Duration(10)*time.Second)
 	if err != nil {
@@ -93,12 +96,12 @@ func (iamopt *IamOptions) startIamServer() bool {
 	glog.V(0).Infof("Start Seaweed IAM API Server %s at http port %d", version.Version(), *iamopt.port)
 	if iamApiLocalListener != nil {
 		go func() {
-			if err = httpS.Serve(iamApiLocalListener); err != nil {
+			if err = newHttpServer(router, nil).Serve(iamApiLocalListener); err != nil {
 				glog.Errorf("IAM API Server Fail to serve: %v", err)
 			}
 		}()
 	}
-	if err = httpS.Serve(iamApiListener); err != nil {
+	if err = newHttpServer(router, nil).Serve(iamApiListener); err != nil {
 		glog.Fatalf("IAM API Server Fail to serve: %v", err)
 	}
 

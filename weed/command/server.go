@@ -1,16 +1,16 @@
 package command
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
 	"time"
 
-	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
-
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
+	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
 )
@@ -24,14 +24,15 @@ type ServerOptions struct {
 }
 
 var (
-	serverOptions   ServerOptions
-	masterOptions   MasterOptions
-	filerOptions    FilerOptions
-	s3Options       S3Options
-	sftpOptions     SftpOptions
-	iamOptions      IamOptions
-	webdavOptions   WebDavOption
-	mqBrokerOptions MessageQueueBrokerOptions
+	serverOptions        ServerOptions
+	masterOptions        MasterOptions
+	filerOptions         FilerOptions
+	s3Options            S3Options
+	sftpOptions          SftpOptions
+	iamOptions           IamOptions
+	webdavOptions        WebDavOption
+	mqBrokerOptions      MessageQueueBrokerOptions
+	mqAgentServerOptions MessageQueueAgentOptions
 )
 
 func init() {
@@ -78,6 +79,7 @@ var (
 	isStartingIam          = cmdServer.Flag.Bool("iam", false, "whether to start IAM service")
 	isStartingWebDav       = cmdServer.Flag.Bool("webdav", false, "whether to start WebDAV gateway")
 	isStartingMqBroker     = cmdServer.Flag.Bool("mq.broker", false, "whether to start message queue broker")
+	isStartingMqAgent      = cmdServer.Flag.Bool("mq.agent", false, "whether to start message queue agent")
 
 	False = false
 )
@@ -104,6 +106,8 @@ func init() {
 	masterOptions.raftBootstrap = cmdServer.Flag.Bool("master.raftBootstrap", false, "Whether to bootstrap the Raft cluster")
 	masterOptions.heartbeatInterval = cmdServer.Flag.Duration("master.heartbeatInterval", 300*time.Millisecond, "heartbeat interval of master servers, and will be randomly multiplied by [1, 1.25)")
 	masterOptions.electionTimeout = cmdServer.Flag.Duration("master.electionTimeout", 10*time.Second, "election timeout of master servers")
+	masterOptions.telemetryUrl = cmdServer.Flag.String("master.telemetry.url", "https://telemetry.seaweedfs.com/api/collect", "telemetry server URL to send usage statistics")
+	masterOptions.telemetryEnabled = cmdServer.Flag.Bool("master.telemetry", false, "enable telemetry reporting")
 
 	filerOptions.filerGroup = cmdServer.Flag.String("filer.filerGroup", "", "share metadata with other filers in the same filerGroup")
 	filerOptions.collection = cmdServer.Flag.String("filer.collection", "", "all data will be stored in this collection")
@@ -141,6 +145,8 @@ func init() {
 	serverOptions.v.pprof = cmdServer.Flag.Bool("volume.pprof", false, "enable pprof http handlers. precludes --memprofile and --cpuprofile")
 	serverOptions.v.idxFolder = cmdServer.Flag.String("volume.dir.idx", "", "directory to store .idx files")
 	serverOptions.v.inflightUploadDataTimeout = cmdServer.Flag.Duration("volume.inflightUploadDataTimeout", 60*time.Second, "inflight upload data wait timeout of volume servers")
+	serverOptions.v.inflightDownloadDataTimeout = cmdServer.Flag.Duration("volume.inflightDownloadDataTimeout", 60*time.Second, "inflight download data wait timeout of volume servers")
+
 	serverOptions.v.hasSlowRead = cmdServer.Flag.Bool("volume.hasSlowRead", true, "<experimental> if true, this prevents slow reads from blocking other requests, but large file read P99 latency will increase.")
 	serverOptions.v.readBufferSizeMB = cmdServer.Flag.Int("volume.readBufferSizeMB", 4, "<experimental> larger values can optimize query performance but will increase some memory usage,Use with hasSlowRead normally")
 
@@ -187,6 +193,9 @@ func init() {
 
 	mqBrokerOptions.port = cmdServer.Flag.Int("mq.broker.port", 17777, "message queue broker gRPC listen port")
 
+	mqAgentServerOptions.brokersString = cmdServer.Flag.String("mq.agent.brokers", "localhost:17777", "comma-separated message queue brokers")
+	mqAgentServerOptions.port = cmdServer.Flag.Int("mq.agent.port", 16777, "message queue agent gRPC listen port")
+
 }
 
 func runServer(cmd *Command, args []string) bool {
@@ -213,6 +222,10 @@ func runServer(cmd *Command, args []string) bool {
 		*isStartingFiler = true
 	}
 	if *isStartingMqBroker {
+		*isStartingFiler = true
+	}
+	if *isStartingMqAgent {
+		*isStartingMqBroker = true
 		*isStartingFiler = true
 	}
 
@@ -254,6 +267,8 @@ func runServer(cmd *Command, args []string) bool {
 	mqBrokerOptions.ip = serverIp
 	mqBrokerOptions.masters = filerOptions.masters.GetInstancesAsMap()
 	mqBrokerOptions.filerGroup = filerOptions.filerGroup
+	mqAgentServerOptions.ip = serverIp
+	mqAgentServerOptions.brokers = pb.ServerAddresses(*mqAgentServerOptions.brokersString).ToAddresses()
 
 	// serverOptions.v.pulseSeconds = pulseSeconds
 	// masterOptions.pulseSeconds = pulseSeconds
@@ -342,6 +357,13 @@ func runServer(cmd *Command, args []string) bool {
 		}()
 	}
 
+	if *isStartingMqAgent {
+		go func() {
+			time.Sleep(2 * time.Second)
+			mqAgentServerOptions.startQueueAgent()
+		}()
+	}
+
 	// start volume server
 	if *isStartingVolumeServer {
 		minFreeSpaces := util.MustParseMinFreeSpace(*volumeMinFreeSpace, *volumeMinFreeSpacePercent)
@@ -353,4 +375,14 @@ func runServer(cmd *Command, args []string) bool {
 	}
 
 	select {}
+}
+
+func newHttpServer(h http.Handler, tlsConfig *tls.Config) *http.Server {
+	s := &http.Server{
+		Handler: h,
+	}
+	if tlsConfig != nil {
+		s.TLSConfig = tlsConfig.Clone()
+	}
+	return s
 }

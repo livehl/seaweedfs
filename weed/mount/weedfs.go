@@ -3,11 +3,11 @@ package mount
 import (
 	"context"
 	"errors"
-	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"math/rand"
 	"os"
 	"path"
 	"path/filepath"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/mount/meta_cache"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
@@ -23,6 +24,7 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	"github.com/seaweedfs/seaweedfs/weed/util/grace"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -61,6 +63,14 @@ type Option struct {
 	Cipher             bool   // whether encrypt data on volume server
 	UidGidMapper       *meta_cache.UidGidMapper
 
+	// RDMA acceleration options
+	RdmaEnabled       bool
+	RdmaSidecarAddr   string
+	RdmaFallback      bool
+	RdmaReadOnly      bool
+	RdmaMaxConcurrent int
+	RdmaTimeoutMs     int
+
 	uniqueCacheDirForRead  string
 	uniqueCacheDirForWrite string
 }
@@ -71,19 +81,22 @@ type WFS struct {
 	fuse.RawFileSystem
 	mount_pb.UnimplementedSeaweedMountServer
 	fs.Inode
-	option            *Option
-	metaCache         *meta_cache.MetaCache
-	stats             statsCache
-	chunkCache        *chunk_cache.TieredChunkCache
-	signature         int32
-	concurrentWriters *util.LimitedConcurrentExecutor
-	inodeToPath       *InodeToPath
-	fhMap             *FileHandleToInode
-	dhMap             *DirectoryHandleToInode
-	fuseServer        *fuse.Server
-	IsOverQuota       bool
-	fhLockTable       *util.LockTable[FileHandleId]
-	FilerConf         *filer.FilerConf
+	option               *Option
+	metaCache            *meta_cache.MetaCache
+	stats                statsCache
+	chunkCache           *chunk_cache.TieredChunkCache
+	signature            int32
+	concurrentWriters    *util.LimitedConcurrentExecutor
+	copyBufferPool       sync.Pool
+	concurrentCopiersSem chan struct{}
+	inodeToPath          *InodeToPath
+	fhMap                *FileHandleToInode
+	dhMap                *DirectoryHandleToInode
+	fuseServer           *fuse.Server
+	IsOverQuota          bool
+	fhLockTable          *util.LockTable[FileHandleId]
+	rdmaClient           *RDMAMountClient
+	FilerConf            *filer.FilerConf
 }
 
 func NewSeaweedFileSystem(option *Option) *WFS {
@@ -135,10 +148,34 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		wfs.metaCache.Shutdown()
 		os.RemoveAll(option.getUniqueCacheDirForWrite())
 		os.RemoveAll(option.getUniqueCacheDirForRead())
+		if wfs.rdmaClient != nil {
+			wfs.rdmaClient.Close()
+		}
 	})
+
+	// Initialize RDMA client if enabled
+	if option.RdmaEnabled && option.RdmaSidecarAddr != "" {
+		rdmaClient, err := NewRDMAMountClient(
+			option.RdmaSidecarAddr,
+			wfs.LookupFn(),
+			option.RdmaMaxConcurrent,
+			option.RdmaTimeoutMs,
+		)
+		if err != nil {
+			glog.Warningf("Failed to initialize RDMA client: %v", err)
+		} else {
+			wfs.rdmaClient = rdmaClient
+			glog.Infof("RDMA acceleration enabled: sidecar=%s, maxConcurrent=%d, timeout=%dms",
+				option.RdmaSidecarAddr, option.RdmaMaxConcurrent, option.RdmaTimeoutMs)
+		}
+	}
 
 	if wfs.option.ConcurrentWriters > 0 {
 		wfs.concurrentWriters = util.NewLimitedConcurrentExecutor(wfs.option.ConcurrentWriters)
+		wfs.concurrentCopiersSem = make(chan struct{}, wfs.option.ConcurrentWriters)
+	}
+	wfs.copyBufferPool.New = func() any {
+		return make([]byte, option.ChunkSizeLimit)
 	}
 	return wfs
 }
@@ -183,7 +220,6 @@ func (wfs *WFS) maybeReadEntry(inode uint64) (path util.FullPath, fh *FileHandle
 }
 
 func (wfs *WFS) maybeLoadEntry(fullpath util.FullPath) (*filer_pb.Entry, fuse.Status) {
-
 	// glog.V(3).Infof("read entry cache miss %s", fullpath)
 	dir, name := fullpath.DirAndName()
 

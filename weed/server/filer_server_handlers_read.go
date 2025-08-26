@@ -1,7 +1,6 @@
 package weed_server
 
 import (
-	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -17,11 +16,9 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/s3api/s3_constants"
 	"github.com/seaweedfs/seaweedfs/weed/security"
-	"github.com/seaweedfs/seaweedfs/weed/util/mem"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
-	"github.com/seaweedfs/seaweedfs/weed/images"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
@@ -102,11 +99,11 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		if err == filer_pb.ErrNotFound {
-			glog.V(2).Infof("Not found %s: %v", path, err)
+			glog.V(2).InfofCtx(ctx, "Not found %s: %v", path, err)
 			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadNotFound).Inc()
 			w.WriteHeader(http.StatusNotFound)
 		} else {
-			glog.Errorf("Internal %s: %v", path, err)
+			glog.ErrorfCtx(ctx, "Internal %s: %v", path, err)
 			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadInternal).Inc()
 			w.WriteHeader(http.StatusInternalServerError)
 		}
@@ -195,8 +192,9 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 
 	// print out the header from extended properties
 	for k, v := range entry.Extended {
-		if !strings.HasPrefix(k, "xattr-") {
+		if !strings.HasPrefix(k, "xattr-") && !strings.HasPrefix(k, "x-seaweedfs-") {
 			// "xattr-" prefix is set in filesys.XATTR_PREFIX
+			// "x-seaweedfs-" prefix is for internal metadata that should not become HTTP headers
 			w.Header().Set(k, string(v))
 		}
 	}
@@ -222,36 +220,40 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		w.Header().Set(s3_constants.AmzTagCount, strconv.Itoa(tagCount))
 	}
 
+	// Set SSE metadata headers for S3 API consumption
+	if sseIV, exists := entry.Extended[s3_constants.SeaweedFSSSEIV]; exists {
+		// Convert binary IV to base64 for HTTP header
+		ivBase64 := base64.StdEncoding.EncodeToString(sseIV)
+		w.Header().Set(s3_constants.SeaweedFSSSEIVHeader, ivBase64)
+	}
+
+	// Set SSE-C algorithm and key MD5 headers for S3 API response
+	if sseAlgorithm, exists := entry.Extended[s3_constants.AmzServerSideEncryptionCustomerAlgorithm]; exists {
+		w.Header().Set(s3_constants.AmzServerSideEncryptionCustomerAlgorithm, string(sseAlgorithm))
+	}
+	if sseKeyMD5, exists := entry.Extended[s3_constants.AmzServerSideEncryptionCustomerKeyMD5]; exists {
+		w.Header().Set(s3_constants.AmzServerSideEncryptionCustomerKeyMD5, string(sseKeyMD5))
+	}
+
+	if sseKMSKey, exists := entry.Extended[s3_constants.SeaweedFSSSEKMSKey]; exists {
+		// Convert binary KMS metadata to base64 for HTTP header
+		kmsBase64 := base64.StdEncoding.EncodeToString(sseKMSKey)
+		w.Header().Set(s3_constants.SeaweedFSSSEKMSKeyHeader, kmsBase64)
+	}
+
 	SetEtag(w, etag)
 
 	filename := entry.Name()
 	AdjustPassthroughHeaders(w, r, filename)
-	totalSize := int64(entry.Size())
+
+	// For range processing, use the original content size, not the encrypted size
+	// entry.Size() returns max(chunk_sizes, file_size) where chunk_sizes include encryption overhead
+	// For SSE objects, we need the original unencrypted size for proper range validation
+	totalSize := int64(entry.FileSize)
 
 	if r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
 		return
-	}
-
-	if rangeReq := r.Header.Get("Range"); rangeReq == "" {
-		ext := filepath.Ext(filename)
-		if len(ext) > 0 {
-			ext = strings.ToLower(ext)
-		}
-		width, height, mode, shouldResize := shouldResizeImages(ext, r)
-		if shouldResize {
-			data := mem.Allocate(int(totalSize))
-			defer mem.Free(data)
-			err := filer.ReadAll(ctx, data, fs.filer.MasterClient, entry.GetChunks())
-			if err != nil {
-				glog.Errorf("failed to read %s: %v", path, err)
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			rs, _, _ := images.Resized(ext, bytes.NewReader(data), width, height, mode)
-			io.Copy(w, rs)
-			return
-		}
 	}
 
 	ProcessRangeRequest(r, w, totalSize, mimeType, func(offset int64, size int64) (filer.DoStreamContent, error) {
@@ -260,7 +262,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 				_, err := writer.Write(entry.Content[offset : offset+size])
 				if err != nil {
 					stats.FilerHandlerCounter.WithLabelValues(stats.ErrorWriteEntry).Inc()
-					glog.Errorf("failed to write entry content: %v", err)
+					glog.ErrorfCtx(ctx, "failed to write entry content: %v", err)
 				}
 				return err
 			}, nil
@@ -273,7 +275,7 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 				Name:      name,
 			}); err != nil {
 				stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadCache).Inc()
-				glog.Errorf("CacheRemoteObjectToLocalCluster %s: %v", entry.FullPath, err)
+				glog.ErrorfCtx(ctx, "CacheRemoteObjectToLocalCluster %s: %v", entry.FullPath, err)
 				return nil, fmt.Errorf("cache %s: %v", entry.FullPath, err)
 			} else {
 				chunks = resp.Entry.GetChunks()
@@ -283,14 +285,14 @@ func (fs *FilerServer) GetOrHeadHandler(w http.ResponseWriter, r *http.Request) 
 		streamFn, err := filer.PrepareStreamContentWithThrottler(ctx, fs.filer.MasterClient, fs.maybeGetVolumeReadJwtAuthorizationToken, chunks, offset, size, fs.option.DownloadMaxBytesPs)
 		if err != nil {
 			stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
-			glog.Errorf("failed to prepare stream content %s: %v", r.URL, err)
+			glog.ErrorfCtx(ctx, "failed to prepare stream content %s: %v", r.URL, err)
 			return nil, err
 		}
 		return func(writer io.Writer) error {
 			err := streamFn(writer)
 			if err != nil {
 				stats.FilerHandlerCounter.WithLabelValues(stats.ErrorReadStream).Inc()
-				glog.Errorf("failed to stream content %s: %v", r.URL, err)
+				glog.ErrorfCtx(ctx, "failed to stream content %s: %v", r.URL, err)
 			}
 			return err
 		}, nil

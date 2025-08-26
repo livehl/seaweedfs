@@ -6,8 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
+
 	"github.com/seaweedfs/seaweedfs/weed/util"
 	"github.com/seaweedfs/seaweedfs/weed/util/mem"
+	"github.com/seaweedfs/seaweedfs/weed/util/request_id"
+
 	"io"
 	"net/http"
 	"net/url"
@@ -15,9 +19,23 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+
+	"github.com/seaweedfs/seaweedfs/weed/security"
 )
 
 var ErrNotFound = fmt.Errorf("not found")
+
+var (
+	jwtSigningReadKey        security.SigningKey
+	jwtSigningReadKeyExpires int
+	loadJwtConfigOnce        sync.Once
+)
+
+func loadJwtConfig() {
+	v := util.GetViper()
+	jwtSigningReadKey = security.SigningKey(v.GetString("jwt.signing.read.key"))
+	jwtSigningReadKeyExpires = v.GetInt("jwt.signing.read.expires_after_seconds")
+}
 
 func Post(url string, values url.Values) ([]byte, error) {
 	r, err := GetGlobalHttpClient().PostForm(url, values)
@@ -282,7 +300,7 @@ func ReadUrl(ctx context.Context, fileUrl string, cipherKey []byte, isContentCom
 	// drains the response body to avoid memory leak
 	data, _ := io.ReadAll(reader)
 	if len(data) != 0 {
-		glog.V(1).Infof("%s reader has remaining %d bytes", contentEncoding, len(data))
+		glog.V(1).InfofCtx(ctx, "%s reader has remaining %d bytes", contentEncoding, len(data))
 	}
 	return n, err
 }
@@ -307,7 +325,7 @@ func ReadUrlAsStreamAuthenticated(ctx context.Context, fileUrl, jwt string, ciph
 	} else {
 		req.Header.Add("Range", fmt.Sprintf("bytes=%d-%d", offset, offset+int64(size)-1))
 	}
-	util.ReqWithRequestId(req, ctx)
+	request_id.InjectToRequest(ctx, req)
 
 	r, err := GetGlobalHttpClient().Do(req)
 	if err != nil {
@@ -339,6 +357,13 @@ func ReadUrlAsStreamAuthenticated(ctx context.Context, fileUrl, jwt string, ciph
 	defer mem.Free(buf)
 
 	for {
+		// Check for context cancellation before each read
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		default:
+		}
+
 		m, err = reader.Read(buf)
 		if m > 0 {
 			fn(buf[:m])
@@ -365,7 +390,7 @@ func readEncryptedUrl(ctx context.Context, fileUrl, jwt string, cipherKey []byte
 	if isContentCompressed {
 		decryptedData, err = util.DecompressData(decryptedData)
 		if err != nil {
-			glog.V(0).Infof("unzip decrypt %s: %v", fileUrl, err)
+			glog.V(0).InfofCtx(ctx, "unzip decrypt %s: %v", fileUrl, err)
 		}
 	}
 	if len(decryptedData) < int(offset)+size {
@@ -374,7 +399,8 @@ func readEncryptedUrl(ctx context.Context, fileUrl, jwt string, cipherKey []byte
 	if isFullChunk {
 		fn(decryptedData)
 	} else {
-		fn(decryptedData[int(offset) : int(offset)+size])
+		sliceEnd := int(offset) + size
+		fn(decryptedData[int(offset):sliceEnd])
 	}
 	return false, nil
 }
@@ -449,17 +475,49 @@ func (r *CountingReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-func RetriedFetchChunkData(ctx context.Context, buffer []byte, urlStrings []string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64) (n int, err error) {
+func RetriedFetchChunkData(ctx context.Context, buffer []byte, urlStrings []string, cipherKey []byte, isGzipped bool, isFullChunk bool, offset int64, fileId string) (n int, err error) {
+
+	loadJwtConfigOnce.Do(loadJwtConfig)
+	var jwt security.EncodedJwt
+	if len(jwtSigningReadKey) > 0 {
+		jwt = security.GenJwtForVolumeServer(
+			jwtSigningReadKey,
+			jwtSigningReadKeyExpires,
+			fileId,
+		)
+	}
 
 	var shouldRetry bool
 
 	for waitTime := time.Second; waitTime < util.RetryWaitTime; waitTime += waitTime / 2 {
+		// Check for context cancellation before starting retry loop
+		select {
+		case <-ctx.Done():
+			return n, ctx.Err()
+		default:
+		}
+
 		for _, urlString := range urlStrings {
+			// Check for context cancellation before each volume server request
+			select {
+			case <-ctx.Done():
+				return n, ctx.Err()
+			default:
+			}
+
 			n = 0
 			if strings.Contains(urlString, "%") {
 				urlString = url.PathEscape(urlString)
 			}
-			shouldRetry, err = ReadUrlAsStream(ctx, urlString+"?readDeleted=true", cipherKey, isGzipped, isFullChunk, offset, len(buffer), func(data []byte) {
+			shouldRetry, err = ReadUrlAsStreamAuthenticated(ctx, urlString+"?readDeleted=true", string(jwt), cipherKey, isGzipped, isFullChunk, offset, len(buffer), func(data []byte) {
+				// Check for context cancellation during data processing
+				select {
+				case <-ctx.Done():
+					// Stop processing data when context is cancelled
+					return
+				default:
+				}
+
 				if n < len(buffer) {
 					x := copy(buffer[n:], data)
 					n += x
@@ -469,14 +527,22 @@ func RetriedFetchChunkData(ctx context.Context, buffer []byte, urlStrings []stri
 				break
 			}
 			if err != nil {
-				glog.V(0).Infof("read %s failed, err: %v", urlString, err)
+				glog.V(0).InfofCtx(ctx, "read %s failed, err: %v", urlString, err)
 			} else {
 				break
 			}
 		}
 		if err != nil && shouldRetry {
-			glog.V(0).Infof("retry reading in %v", waitTime)
-			time.Sleep(waitTime)
+			glog.V(0).InfofCtx(ctx, "retry reading in %v", waitTime)
+			// Sleep with proper context cancellation and timer cleanup
+			timer := time.NewTimer(waitTime)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return n, ctx.Err()
+			case <-timer.C:
+				// Continue with retry
+			}
 		} else {
 			break
 		}

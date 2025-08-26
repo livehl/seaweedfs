@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"io"
+	"math"
+	"strings"
+
 	"github.com/parquet-go/parquet-go"
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/mq/schema"
@@ -13,9 +17,6 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util/chunk_cache"
 	"github.com/seaweedfs/seaweedfs/weed/util/log_buffer"
 	"google.golang.org/protobuf/proto"
-	"io"
-	"math"
-	"strings"
 )
 
 var (
@@ -42,10 +43,6 @@ func GenParquetReadFunc(filerClient filer_pb.FilerClient, t topic.Topic, p topic
 		WithField(SW_COLUMN_NAME_KEY, schema.TypeBytes).
 		RecordTypeEnd()
 
-	parquetSchema, err := schema.ToParquetSchema(t.Name, recordType)
-	if err != nil {
-		return nil
-	}
 	parquetLevels, err := schema.ToParquetLevels(recordType)
 	if err != nil {
 		return nil
@@ -58,20 +55,21 @@ func GenParquetReadFunc(filerClient filer_pb.FilerClient, t topic.Topic, p topic
 		visibleIntervals, _ := filer.NonOverlappingVisibleIntervals(context.Background(), lookupFileIdFn, entry.Chunks, 0, int64(fileSize))
 		chunkViews := filer.ViewFromVisibleIntervals(visibleIntervals, 0, int64(fileSize))
 		readerCache := filer.NewReaderCache(32, chunkCache, lookupFileIdFn)
-		readerAt := filer.NewChunkReaderAtFromClient(readerCache, chunkViews, int64(fileSize))
+		readerAt := filer.NewChunkReaderAtFromClient(context.Background(), readerCache, chunkViews, int64(fileSize))
 
 		// create parquet reader
-		parquetReader := parquet.NewReader(readerAt, parquetSchema)
+		parquetReader := parquet.NewReader(readerAt)
 		rows := make([]parquet.Row, 128)
 		for {
 			rowCount, readErr := parquetReader.ReadRows(rows)
 
+			// Process the rows first, even if EOF is returned
 			for i := 0; i < rowCount; i++ {
 				row := rows[i]
 				// convert parquet row to schema_pb.RecordValue
 				recordValue, err := schema.ToRecordValue(recordType, parquetLevels, row)
 				if err != nil {
-					return processedTsNs, fmt.Errorf("ToRecordValue failed: %v", err)
+					return processedTsNs, fmt.Errorf("ToRecordValue failed: %w", err)
 				}
 				processedTsNs = recordValue.Fields[SW_COLUMN_NAME_TS].GetInt64Value()
 				if processedTsNs <= starTsNs {
@@ -83,7 +81,7 @@ func GenParquetReadFunc(filerClient filer_pb.FilerClient, t topic.Topic, p topic
 
 				data, marshalErr := proto.Marshal(recordValue)
 				if marshalErr != nil {
-					return processedTsNs, fmt.Errorf("marshal record value: %v", marshalErr)
+					return processedTsNs, fmt.Errorf("marshal record value: %w", marshalErr)
 				}
 
 				logEntry := &filer_pb.LogEntry{
@@ -95,15 +93,19 @@ func GenParquetReadFunc(filerClient filer_pb.FilerClient, t topic.Topic, p topic
 				// fmt.Printf(" parquet entry %s ts %v\n", string(logEntry.Key), time.Unix(0, logEntry.TsNs).UTC())
 
 				if _, err = eachLogEntryFn(logEntry); err != nil {
-					return processedTsNs, fmt.Errorf("process log entry %v: %v", logEntry, err)
+					return processedTsNs, fmt.Errorf("process log entry %v: %w", logEntry, err)
 				}
 			}
 
+			// Check for end conditions after processing rows
 			if readErr != nil {
 				if readErr == io.EOF {
 					return processedTsNs, nil
 				}
 				return processedTsNs, readErr
+			}
+			if rowCount == 0 {
+				return processedTsNs, nil
 			}
 		}
 		return

@@ -46,7 +46,7 @@ import (
 //
 // returns signature, error otherwise if the signature mismatches or any other
 // error while parsing and validating.
-func (iam *IdentityAccessManagement) calculateSeedSignature(r *http.Request) (cred *Credential, signature string, region string, date time.Time, errCode s3err.ErrorCode) {
+func (iam *IdentityAccessManagement) calculateSeedSignature(r *http.Request) (cred *Credential, signature string, region string, service string, date time.Time, errCode s3err.ErrorCode) {
 
 	// Copy request.
 	req := *r
@@ -57,7 +57,7 @@ func (iam *IdentityAccessManagement) calculateSeedSignature(r *http.Request) (cr
 	// Parse signature version '4' header.
 	signV4Values, errCode := parseSignV4(v4Auth)
 	if errCode != s3err.ErrNone {
-		return nil, "", "", time.Time{}, errCode
+		return nil, "", "", "", time.Time{}, errCode
 	}
 
 	contentSha256Header := req.Header.Get("X-Amz-Content-Sha256")
@@ -69,7 +69,7 @@ func (iam *IdentityAccessManagement) calculateSeedSignature(r *http.Request) (cr
 	case streamingUnsignedPayload:
 		glog.V(3).Infof("streaming unsigned payload")
 	default:
-		return nil, "", "", time.Time{}, s3err.ErrContentSHA256Mismatch
+		return nil, "", "", "", time.Time{}, s3err.ErrContentSHA256Mismatch
 	}
 
 	// Payload streaming.
@@ -78,12 +78,12 @@ func (iam *IdentityAccessManagement) calculateSeedSignature(r *http.Request) (cr
 	// Extract all the signed headers along with its values.
 	extractedSignedHeaders, errCode := extractSignedHeaders(signV4Values.SignedHeaders, r)
 	if errCode != s3err.ErrNone {
-		return nil, "", "", time.Time{}, errCode
+		return nil, "", "", "", time.Time{}, errCode
 	}
 	// Verify if the access key id matches.
 	identity, cred, found := iam.lookupByAccessKey(signV4Values.Credential.accessKey)
 	if !found {
-		return nil, "", "", time.Time{}, s3err.ErrInvalidAccessKeyID
+		return nil, "", "", "", time.Time{}, s3err.ErrInvalidAccessKeyID
 	}
 
 	bucket, object := s3_constants.GetBucketAndObject(r)
@@ -99,16 +99,15 @@ func (iam *IdentityAccessManagement) calculateSeedSignature(r *http.Request) (cr
 	var dateStr string
 	if dateStr = req.Header.Get(http.CanonicalHeaderKey("x-amz-date")); dateStr == "" {
 		if dateStr = r.Header.Get("Date"); dateStr == "" {
-			return nil, "", "", time.Time{}, s3err.ErrMissingDateHeader
+			return nil, "", "", "", time.Time{}, s3err.ErrMissingDateHeader
 		}
 	}
-	// Parse date header.
-	var err error
-	date, err = time.Parse(iso8601Format, dateStr)
-	if err != nil {
-		return nil, "", "", time.Time{}, s3err.ErrMalformedDate
-	}
 
+	// Parse date header.
+	date, err := time.Parse(iso8601Format, dateStr)
+	if err != nil {
+		return nil, "", "", "", time.Time{}, s3err.ErrMalformedDate
+	}
 	// Query string.
 	queryStr := req.URL.Query().Encode()
 
@@ -118,22 +117,19 @@ func (iam *IdentityAccessManagement) calculateSeedSignature(r *http.Request) (cr
 	// Get string to sign from canonical request.
 	stringToSign := getStringToSign(canonicalRequest, date, signV4Values.Credential.getScope())
 
+	// Get hmac signing key.
+	signingKey := getSigningKey(cred.SecretKey, signV4Values.Credential.scope.date.Format(yyyymmdd), region, signV4Values.Credential.scope.service)
+
 	// Calculate signature.
-	newSignature := iam.getSignature(
-		cred.SecretKey,
-		signV4Values.Credential.scope.date,
-		region,
-		"s3",
-		stringToSign,
-	)
+	newSignature := getSignature(signingKey, stringToSign)
 
 	// Verify if signature match.
 	if !compareSignatureV4(newSignature, signV4Values.Signature) {
-		return nil, "", "", time.Time{}, s3err.ErrSignatureDoesNotMatch
+		return nil, "", "", "", time.Time{}, s3err.ErrSignatureDoesNotMatch
 	}
 
 	// Return calculated signature.
-	return cred, newSignature, region, date, s3err.ErrNone
+	return cred, newSignature, region, signV4Values.Credential.scope.service, date, s3err.ErrNone
 }
 
 const maxLineLength = 4 * humanize.KiByte // assumed <= bufio.defaultBufSize 4KiB
@@ -154,7 +150,7 @@ func (iam *IdentityAccessManagement) newChunkedReader(req *http.Request) (io.Rea
 	authorizationHeader := req.Header.Get("Authorization")
 
 	var ident *Credential
-	var seedSignature, region string
+	var seedSignature, region, service string
 	var seedDate time.Time
 	var errCode s3err.ErrorCode
 
@@ -162,7 +158,7 @@ func (iam *IdentityAccessManagement) newChunkedReader(req *http.Request) (io.Rea
 	// Payload for STREAMING signature should be 'STREAMING-AWS4-HMAC-SHA256-PAYLOAD'
 	case streamingContentSHA256:
 		glog.V(3).Infof("streaming content sha256")
-		ident, seedSignature, region, seedDate, errCode = iam.calculateSeedSignature(req)
+		ident, seedSignature, region, service, seedDate, errCode = iam.calculateSeedSignature(req)
 		if errCode != s3err.ErrNone {
 			return nil, errCode
 		}
@@ -171,7 +167,7 @@ func (iam *IdentityAccessManagement) newChunkedReader(req *http.Request) (io.Rea
 		if authorizationHeader != "" {
 			// We do not need to pass the seed signature to the Reader as each chunk is not signed,
 			// but we do compute it to verify the caller has the correct permissions.
-			_, _, _, _, errCode = iam.calculateSeedSignature(req)
+			_, _, _, _, _, errCode = iam.calculateSeedSignature(req)
 			if errCode != s3err.ErrNone {
 				return nil, errCode
 			}
@@ -195,6 +191,7 @@ func (iam *IdentityAccessManagement) newChunkedReader(req *http.Request) (io.Rea
 		seedSignature:     seedSignature,
 		seedDate:          seedDate,
 		region:            region,
+		service:           service,
 		chunkSHA256Writer: sha256.New(),
 		checkSumAlgorithm: checksumAlgorithm.String(),
 		checkSumWriter:    checkSumWriter,
@@ -231,6 +228,7 @@ type s3ChunkedReader struct {
 	seedSignature     string
 	seedDate          time.Time
 	region            string
+	service           string // Service from credential scope (e.g., "s3", "iam")
 	state             chunkState
 	lastChunk         bool
 	chunkSignature    string // Empty string if unsigned streaming upload.
@@ -379,16 +377,15 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 			if extractedCheckSumAlgorithm.String() != cr.checkSumAlgorithm {
 				errorMessage := fmt.Sprintf("checksum algorithm in trailer '%s' does not match the one advertised in the header '%s'", extractedCheckSumAlgorithm.String(), cr.checkSumAlgorithm)
 				glog.V(3).Info(errorMessage)
-				cr.err = errors.New(errorMessage)
+				cr.err = errors.New(s3err.ErrMsgChecksumAlgorithmMismatch)
 				return 0, cr.err
 			}
 
 			computedChecksum := cr.checkSumWriter.Sum(nil)
 			base64Checksum := base64.StdEncoding.EncodeToString(computedChecksum)
 			if string(extractedChecksum) != base64Checksum {
-				// TODO: Return BadDigest
 				glog.V(3).Infof("payload checksum '%s' does not match provided checksum '%s'", base64Checksum, string(extractedChecksum))
-				cr.err = errors.New("payload checksum does not match")
+				cr.err = errors.New(s3err.ErrMsgPayloadChecksumMismatch)
 				return 0, cr.err
 			}
 
@@ -443,18 +440,35 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 				continue
 			}
 		case verifyChunk:
-			// Calculate the hashed chunk.
-			hashedChunk := hex.EncodeToString(cr.chunkSHA256Writer.Sum(nil))
-			// Calculate the chunk signature.
-			newSignature := cr.getChunkSignature(hashedChunk)
-			if !compareSignatureV4(cr.chunkSignature, newSignature) {
-				// Chunk signature doesn't match we return signature does not match.
-				cr.err = errors.New("chunk signature does not match")
-				return 0, cr.err
+			// Check if we have credentials for signature verification
+			// This handles the case where we have unsigned streaming (no cred) but chunks contain signatures
+			//
+			// BUG FIX for GitHub issue #6847:
+			// Some AWS SDK versions (Java 3.7.412+, .NET 4.0.0-preview.6+) send mixed format:
+			// - HTTP headers indicate unsigned streaming (STREAMING-UNSIGNED-PAYLOAD-TRAILER)
+			// - But chunk data contains chunk-signature headers (normally only for signed streaming)
+			// This causes a nil pointer dereference when trying to verify signatures without credentials
+			if cr.cred != nil {
+				// Normal signed streaming - verify the chunk signature
+				// Calculate the hashed chunk.
+				hashedChunk := hex.EncodeToString(cr.chunkSHA256Writer.Sum(nil))
+				// Calculate the chunk signature.
+				newSignature := cr.getChunkSignature(hashedChunk)
+				if !compareSignatureV4(cr.chunkSignature, newSignature) {
+					// Chunk signature doesn't match we return signature does not match.
+					cr.err = errors.New(s3err.ErrMsgChunkSignatureMismatch)
+					return 0, cr.err
+				}
+				// Newly calculated signature becomes the seed for the next chunk
+				// this follows the chaining.
+				cr.seedSignature = newSignature
+			} else {
+				// For unsigned streaming, we should not verify chunk signatures even if they are present
+				// This fixes the bug where AWS SDKs send chunk signatures with unsigned streaming headers
+				glog.V(3).Infof("Skipping chunk signature verification for unsigned streaming")
 			}
-			// Newly calculated signature becomes the seed for the next chunk
-			// this follows the chaining.
-			cr.seedSignature = newSignature
+
+			// Common cleanup and state transition for both signed and unsigned streaming
 			cr.chunkSHA256Writer.Reset()
 			if cr.lastChunk {
 				cr.state = eofChunk
@@ -470,66 +484,56 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 // getChunkSignature - get chunk signature.
 func (cr *s3ChunkedReader) getChunkSignature(hashedChunk string) string {
 	// Calculate string to sign.
-	stringToSign := signV4ChunkedAlgorithm + "\n" +
+	stringToSign := signV4Algorithm + "-PAYLOAD" + "\n" +
 		cr.seedDate.Format(iso8601Format) + "\n" +
-		getScope(cr.seedDate, cr.region) + "\n" +
+		getScope(cr.seedDate, cr.region, cr.service) + "\n" +
 		cr.seedSignature + "\n" +
 		emptySHA256 + "\n" +
 		hashedChunk
 
-	// Calculate signature.
-	return cr.iam.getSignature(
-		cr.cred.SecretKey,
-		cr.seedDate,
-		cr.region,
-		"s3",
-		stringToSign,
-	)
+	// Get hmac signing key.
+	signingKey := getSigningKey(cr.cred.SecretKey, cr.seedDate.Format(yyyymmdd), cr.region, cr.service)
+
+	// Calculate and return signature.
+	return getSignature(signingKey, stringToSign)
 }
 
-// readCRLF - check if reader only has '\r\n' CRLF character.
-// returns malformed encoding if it doesn't.
 func readCRLF(reader *bufio.Reader) error {
 	buf := make([]byte, 2)
-	_, err := reader.Read(buf)
+	_, err := io.ReadFull(reader, buf)
 	if err != nil {
 		return err
 	}
 	return checkCRLF(buf)
 }
 
-// peekCRLF - peeks at the next two bytes to check for CRLF without consuming them.
 func peekCRLF(reader *bufio.Reader) error {
-	peeked, err := reader.Peek(2)
+	buf, err := reader.Peek(2)
 	if err != nil {
 		return err
 	}
-	if err := checkCRLF(peeked); err != nil {
+	if err := checkCRLF(buf); err != nil {
 		return err
 	}
 	return nil
 }
 
-// checkCRLF - checks if the buffer contains '\r\n' CRLF character.
 func checkCRLF(buf []byte) error {
-	if buf[0] != '\r' || buf[1] != '\n' {
+	if len(buf) != 2 || buf[0] != '\r' || buf[1] != '\n' {
 		return errMalformedEncoding
 	}
 	return nil
 }
 
-// Read a line of bytes (up to \n) from b.
-// Give up if the line exceeds maxLineLength.
-// The returned bytes are owned by the bufio.Reader
-// so they are only valid until the next bufio read.
 func readChunkLine(b *bufio.Reader) ([]byte, error) {
 	buf, err := b.ReadSlice('\n')
 	if err != nil {
 		// We always know when EOF is coming.
 		// If the caller asked for a line, there should be a line.
-		if err == io.EOF {
+		switch err {
+		case io.EOF:
 			err = io.ErrUnexpectedEOF
-		} else if err == bufio.ErrBufferFull {
+		case bufio.ErrBufferFull:
 			err = errLineTooLong
 		}
 		return nil, err
@@ -537,8 +541,7 @@ func readChunkLine(b *bufio.Reader) ([]byte, error) {
 	if len(buf) >= maxLineLength {
 		return nil, errLineTooLong
 	}
-
-	return buf, nil
+	return trimTrailingWhitespace(buf), nil
 }
 
 // trimTrailingWhitespace - trim trailing white space.
@@ -609,13 +612,11 @@ func parseChunkChecksum(b *bufio.Reader) (ChecksumAlgorithm, []byte) {
 	return extractedAlgorithm, checksumValue
 }
 
-// parseChunkSignature - parse chunk signature.
 func parseChunkSignature(chunk []byte) []byte {
-	chunkSplits := bytes.SplitN(chunk, []byte(s3ChunkSignatureStr), 2)
-	return chunkSplits[1]
+	chunkSplits := bytes.SplitN(chunk, []byte("="), 2)
+	return chunkSplits[1] // Keep only the signature.
 }
 
-// parse hex to uint64.
 func parseHexUint(v []byte) (n uint64, err error) {
 	for i, b := range v {
 		switch {
@@ -637,6 +638,7 @@ func parseHexUint(v []byte) (n uint64, err error) {
 	return
 }
 
+// Checksum Algorithm represents the various checksum algorithms supported.
 type ChecksumAlgorithm int
 
 const (
@@ -650,18 +652,18 @@ const (
 
 func (ca ChecksumAlgorithm) String() string {
 	switch ca {
-	case ChecksumAlgorithmCRC32:
-		return "CRC32"
-	case ChecksumAlgorithmCRC32C:
-		return "CRC32C"
-	case ChecksumAlgorithmCRC64NVMe:
-		return "CRC64NVMe"
-	case ChecksumAlgorithmSHA1:
-		return "SHA1"
-	case ChecksumAlgorithmSHA256:
-		return "SHA256"
 	case ChecksumAlgorithmNone:
 		return ""
+	case ChecksumAlgorithmCRC32:
+		return "x-amz-checksum-crc32"
+	case ChecksumAlgorithmCRC32C:
+		return "x-amz-checksum-crc32c"
+	case ChecksumAlgorithmCRC64NVMe:
+		return "x-amz-checksum-crc64nvme"
+	case ChecksumAlgorithmSHA1:
+		return "x-amz-checksum-sha1"
+	case ChecksumAlgorithmSHA256:
+		return "x-amz-checksum-sha256"
 	}
 	return ""
 }

@@ -16,15 +16,15 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-func loadVolumeWithoutIndex(dirname string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind) (v *Volume, err error) {
+func loadVolumeWithoutIndex(dirname string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind, ver needle.Version) (v *Volume, err error) {
 	v = &Volume{dir: dirname, Collection: collection, Id: id}
 	v.SuperBlock = super_block.SuperBlock{}
 	v.needleMapKind = needleMapKind
-	err = v.load(false, false, needleMapKind, 0)
+	err = v.load(false, false, needleMapKind, 0, ver)
 	return
 }
 
-func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind NeedleMapKind, preallocate int64) (err error) {
+func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind NeedleMapKind, preallocate int64, ver needle.Version) (err error) {
 	alreadyHasSuperBlock := false
 
 	hasLoadedVolume := false
@@ -53,7 +53,7 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		v.noWriteOrDelete = false
 		glog.V(0).Infof("loading volume %d from remote %v", v.Id, v.volumeInfo)
 		if err := v.LoadRemoteFile(); err != nil {
-			return fmt.Errorf("load remote file %v: %v", v.volumeInfo, err)
+			return fmt.Errorf("load remote file %v: %w", v.volumeInfo, err)
 		}
 		alreadyHasSuperBlock = true
 	} else if exists, canRead, canWrite, modifiedTime, fileSize := util.CheckFile(v.FileName(".dat")); exists {
@@ -105,7 +105,7 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		if !v.SuperBlock.Initialized() {
 			return fmt.Errorf("volume %s not initialized", v.FileName(".dat"))
 		}
-		err = v.maybeWriteSuperBlock()
+		err = v.maybeWriteSuperBlock(ver)
 	}
 	if err == nil && alsoLoadIndex {
 		// adjust for existing volumes with .idx together with .dat files

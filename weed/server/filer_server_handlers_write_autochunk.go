@@ -3,11 +3,12 @@ package weed_server
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -52,7 +53,7 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 		if err.Error() == "operation not permitted" {
 			writeJsonError(w, r, http.StatusForbidden, err)
 		} else if strings.HasPrefix(err.Error(), "read input:") || err.Error() == io.ErrUnexpectedEOF.Error() {
-			writeJsonError(w, r, version.HttpStatusCancelled, err)
+			writeJsonError(w, r, util.HttpStatusCancelled, err)
 		} else if strings.HasSuffix(err.Error(), "is a file") || strings.HasSuffix(err.Error(), "already exists") {
 			writeJsonError(w, r, http.StatusConflict, err)
 		} else {
@@ -240,7 +241,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	}
 	mode, err := strconv.ParseUint(modeStr, 8, 32)
 	if err != nil {
-		glog.Errorf("Invalid mode format: %s, use 0660 by default", modeStr)
+		glog.ErrorfCtx(ctx, "Invalid mode format: %s, use 0660 by default", modeStr)
 		mode = 0660
 	}
 
@@ -257,7 +258,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	if isAppend || isOffsetWrite {
 		existingEntry, findErr := fs.filer.FindEntry(ctx, util.FullPath(path))
 		if findErr != nil && findErr != filer_pb.ErrNotFound {
-			glog.V(0).Infof("failing to find %s: %v", path, findErr)
+			glog.V(0).InfofCtx(ctx, "failing to find %s: %v", path, findErr)
 		}
 		entry = existingEntry
 	}
@@ -280,7 +281,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		}
 
 	} else {
-		glog.V(4).Infoln("saving", path)
+		glog.V(4).InfolnCtx(ctx, "saving", path)
 		newChunks = fileChunks
 		entry = &filer.Entry{
 			FullPath: util.FullPath(path),
@@ -302,14 +303,14 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	// maybe concatenate small chunks into one whole chunk
 	mergedChunks, replyerr = fs.maybeMergeChunks(ctx, so, newChunks)
 	if replyerr != nil {
-		glog.V(0).Infof("merge chunks %s: %v", r.RequestURI, replyerr)
+		glog.V(0).InfofCtx(ctx, "merge chunks %s: %v", r.RequestURI, replyerr)
 		mergedChunks = newChunks
 	}
 
 	// maybe compact entry chunks
 	mergedChunks, replyerr = filer.MaybeManifestize(fs.saveAsChunk(ctx, so), mergedChunks)
 	if replyerr != nil {
-		glog.V(0).Infof("manifestize %s: %v", r.RequestURI, replyerr)
+		glog.V(0).InfofCtx(ctx, "manifestize %s: %v", r.RequestURI, replyerr)
 		return
 	}
 	entry.Chunks = mergedChunks
@@ -336,6 +337,37 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 		}
 	}
 
+	// Process SSE metadata headers sent by S3 API and store in entry extended metadata
+	if sseIVHeader := r.Header.Get(s3_constants.SeaweedFSSSEIVHeader); sseIVHeader != "" {
+		// Decode base64-encoded IV and store in metadata
+		if ivData, err := base64.StdEncoding.DecodeString(sseIVHeader); err == nil {
+			entry.Extended[s3_constants.SeaweedFSSSEIV] = ivData
+			glog.V(4).Infof("Stored SSE-C IV metadata for %s", entry.FullPath)
+		} else {
+			glog.Errorf("Failed to decode SSE-C IV header for %s: %v", entry.FullPath, err)
+		}
+	}
+
+	// Store SSE-C algorithm and key MD5 for proper S3 API response headers
+	if sseAlgorithm := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerAlgorithm); sseAlgorithm != "" {
+		entry.Extended[s3_constants.AmzServerSideEncryptionCustomerAlgorithm] = []byte(sseAlgorithm)
+		glog.V(4).Infof("Stored SSE-C algorithm metadata for %s", entry.FullPath)
+	}
+	if sseKeyMD5 := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerKeyMD5); sseKeyMD5 != "" {
+		entry.Extended[s3_constants.AmzServerSideEncryptionCustomerKeyMD5] = []byte(sseKeyMD5)
+		glog.V(4).Infof("Stored SSE-C key MD5 metadata for %s", entry.FullPath)
+	}
+
+	if sseKMSHeader := r.Header.Get(s3_constants.SeaweedFSSSEKMSKeyHeader); sseKMSHeader != "" {
+		// Decode base64-encoded KMS metadata and store
+		if kmsData, err := base64.StdEncoding.DecodeString(sseKMSHeader); err == nil {
+			entry.Extended[s3_constants.SeaweedFSSSEKMSKey] = kmsData
+			glog.V(4).Infof("Stored SSE-KMS metadata for %s", entry.FullPath)
+		} else {
+			glog.Errorf("Failed to decode SSE-KMS metadata header for %s: %v", entry.FullPath, err)
+		}
+	}
+
 	dbErr := fs.filer.CreateEntry(ctx, entry, false, false, nil, skipCheckParentDirEntry(r), so.MaxFileNameLength)
 	// In test_bucket_listv2_delimiter_basic, the valid object key is the parent folder
 	if dbErr != nil && strings.HasSuffix(dbErr.Error(), " is a file") && isS3Request(r) {
@@ -344,7 +376,7 @@ func (fs *FilerServer) saveMetaData(ctx context.Context, r *http.Request, fileNa
 	if dbErr != nil {
 		replyerr = dbErr
 		filerResult.Error = dbErr.Error()
-		glog.V(0).Infof("failing to write %s to filer server : %v", path, dbErr)
+		glog.V(0).InfofCtx(ctx, "failing to write %s to filer server : %v", path, dbErr)
 	}
 	return filerResult, replyerr
 }
@@ -404,7 +436,7 @@ func (fs *FilerServer) mkdir(ctx context.Context, w http.ResponseWriter, r *http
 	}
 	mode, err := strconv.ParseUint(modeStr, 8, 32)
 	if err != nil {
-		glog.Errorf("Invalid mode format: %s, use 0660 by default", modeStr)
+		glog.ErrorfCtx(ctx, "Invalid mode format: %s, use 0660 by default", modeStr)
 		mode = 0660
 	}
 
@@ -420,7 +452,7 @@ func (fs *FilerServer) mkdir(ctx context.Context, w http.ResponseWriter, r *http
 		return
 	}
 
-	glog.V(4).Infoln("mkdir", path)
+	glog.V(4).InfolnCtx(ctx, "mkdir", path)
 	entry := &filer.Entry{
 		FullPath: util.FullPath(path),
 		Attr: filer.Attr{
@@ -440,7 +472,7 @@ func (fs *FilerServer) mkdir(ctx context.Context, w http.ResponseWriter, r *http
 	if dbErr := fs.filer.CreateEntry(ctx, entry, false, false, nil, false, so.MaxFileNameLength); dbErr != nil {
 		replyerr = dbErr
 		filerResult.Error = dbErr.Error()
-		glog.V(0).Infof("failing to create dir %s on filer server : %v", path, dbErr)
+		glog.V(0).InfofCtx(ctx, "failing to create dir %s on filer server : %v", path, dbErr)
 	}
 	return filerResult, replyerr
 }
@@ -463,12 +495,19 @@ func SaveAmzMetaData(r *http.Request, existing map[string][]byte, isReplace bool
 	}
 
 	if tags := r.Header.Get(s3_constants.AmzObjectTagging); tags != "" {
-		for _, v := range strings.Split(tags, "&") {
-			tag := strings.Split(v, "=")
-			if len(tag) == 2 {
-				metadata[s3_constants.AmzObjectTagging+"-"+tag[0]] = []byte(tag[1])
-			} else if len(tag) == 1 {
-				metadata[s3_constants.AmzObjectTagging+"-"+tag[0]] = nil
+		// Use url.ParseQuery for robust parsing and automatic URL decoding
+		parsedTags, err := url.ParseQuery(tags)
+		if err != nil {
+			glog.Errorf("Failed to parse S3 tags '%s': %v", tags, err)
+		} else {
+			for key, values := range parsedTags {
+				// According to S3 spec, if a key is provided multiple times, the last value is used.
+				// A tag value can be an empty string but not nil.
+				value := ""
+				if len(values) > 0 {
+					value = values[len(values)-1]
+				}
+				metadata[s3_constants.AmzObjectTagging+"-"+key] = []byte(value)
 			}
 		}
 	}
@@ -479,6 +518,15 @@ func SaveAmzMetaData(r *http.Request, existing map[string][]byte, isReplace bool
 				metadata[header] = []byte(value)
 			}
 		}
+	}
+
+	// Handle SSE-C headers
+	if algorithm := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerAlgorithm); algorithm != "" {
+		metadata[s3_constants.AmzServerSideEncryptionCustomerAlgorithm] = []byte(algorithm)
+	}
+	if keyMD5 := r.Header.Get(s3_constants.AmzServerSideEncryptionCustomerKeyMD5); keyMD5 != "" {
+		// Store as-is; SSE-C MD5 is base64 and case-sensitive
+		metadata[s3_constants.AmzServerSideEncryptionCustomerKeyMD5] = []byte(keyMD5)
 	}
 
 	//acp-owner

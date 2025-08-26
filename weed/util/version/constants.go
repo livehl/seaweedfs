@@ -2,14 +2,13 @@ package version
 
 import (
 	"fmt"
+
 	"github.com/seaweedfs/seaweedfs/weed/util"
 )
 
-const HttpStatusCancelled = 499
-
 var (
 	MAJOR_VERSION  = int32(3)
-	MINOR_VERSION  = int32(89)
+	MINOR_VERSION  = int32(96)
 	VERSION_NUMBER = fmt.Sprintf("%d.%02d", MAJOR_VERSION, MINOR_VERSION)
 	VERSION        = util.SizeLimit + " " + VERSION_NUMBER
 	COMMIT         = ""

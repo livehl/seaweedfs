@@ -5,31 +5,28 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"github.com/seaweedfs/seaweedfs/weed/util/version"
 	"io/ioutil"
 	"net"
-	"net/http"
 	"os"
 	"runtime"
 	"strings"
 	"time"
 
-	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/gorilla/mux"
 	"google.golang.org/grpc/credentials/tls/certprovider"
 	"google.golang.org/grpc/credentials/tls/certprovider/pemfile"
 	"google.golang.org/grpc/reflection"
 
+	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/s3_pb"
-	"github.com/seaweedfs/seaweedfs/weed/security"
-
-	"github.com/gorilla/mux"
-
-	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/s3api"
+	"github.com/seaweedfs/seaweedfs/weed/s3api/s3err"
+	"github.com/seaweedfs/seaweedfs/weed/security"
 	stats_collect "github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/util"
+	"github.com/seaweedfs/seaweedfs/weed/util/version"
 )
 
 var (
@@ -163,6 +160,14 @@ var cmdS3 = &Command{
   ]
 }
 
+	Alternatively, you can use environment variables as fallback admin credentials:
+
+	AWS_ACCESS_KEY_ID=your_access_key AWS_SECRET_ACCESS_KEY=your_secret_key weed s3
+
+	Environment variables are only used when no S3 configuration file is provided
+	and no configuration is available from the filer. This provides a simple way
+	to get started without requiring configuration files.
+
 `,
 }
 
@@ -250,8 +255,6 @@ func (s3opt *S3Options) startS3Server() bool {
 		glog.Fatalf("S3 API Server startup error: %v", s3ApiServer_err)
 	}
 
-	httpS := &http.Server{Handler: router}
-
 	if *s3opt.portGrpc == 0 {
 		*s3opt.portGrpc = 10000 + *s3opt.port
 	}
@@ -273,7 +276,7 @@ func (s3opt *S3Options) startS3Server() bool {
 			if err != nil {
 				glog.Fatalf("Failed to listen on %s: %v", localSocket, err)
 			}
-			httpS.Serve(s3SocketListener)
+			newHttpServer(router, nil).Serve(s3SocketListener)
 		}()
 	}
 
@@ -330,12 +333,12 @@ func (s3opt *S3Options) startS3Server() bool {
 			clientAuth = tls.RequireAndVerifyClientCert
 		}
 
-		httpS.TLSConfig = &tls.Config{
+		tlsConfig := &tls.Config{
 			GetCertificate: s3opt.GetCertificateWithUpdate,
 			ClientAuth:     clientAuth,
 			ClientCAs:      caCertPool,
 		}
-		err = security.FixTlsConfig(util.GetViper(), httpS.TLSConfig)
+		err = security.FixTlsConfig(util.GetViper(), tlsConfig)
 		if err != nil {
 			glog.Fatalf("error with tls config: %v", err)
 		}
@@ -343,12 +346,12 @@ func (s3opt *S3Options) startS3Server() bool {
 			glog.V(0).Infof("Start Seaweed S3 API Server %s at https port %d", version.Version(), *s3opt.port)
 			if s3ApiLocalListener != nil {
 				go func() {
-					if err = httpS.ServeTLS(s3ApiLocalListener, "", ""); err != nil {
+					if err = newHttpServer(router, tlsConfig).ServeTLS(s3ApiLocalListener, "", ""); err != nil {
 						glog.Fatalf("S3 API Server Fail to serve: %v", err)
 					}
 				}()
 			}
-			if err = httpS.ServeTLS(s3ApiListener, "", ""); err != nil {
+			if err = newHttpServer(router, tlsConfig).ServeTLS(s3ApiListener, "", ""); err != nil {
 				glog.Fatalf("S3 API Server Fail to serve: %v", err)
 			}
 		} else {
@@ -357,13 +360,13 @@ func (s3opt *S3Options) startS3Server() bool {
 				*s3opt.bindIp, *s3opt.portHttps, time.Duration(*s3opt.idleTimeout)*time.Second)
 			if s3ApiLocalListenerHttps != nil {
 				go func() {
-					if err = httpS.ServeTLS(s3ApiLocalListenerHttps, "", ""); err != nil {
+					if err = newHttpServer(router, tlsConfig).ServeTLS(s3ApiLocalListenerHttps, "", ""); err != nil {
 						glog.Fatalf("S3 API Server Fail to serve: %v", err)
 					}
 				}()
 			}
 			go func() {
-				if err = httpS.ServeTLS(s3ApiListenerHttps, "", ""); err != nil {
+				if err = newHttpServer(router, tlsConfig).ServeTLS(s3ApiListenerHttps, "", ""); err != nil {
 					glog.Fatalf("S3 API Server Fail to serve: %v", err)
 				}
 			}()
@@ -373,12 +376,12 @@ func (s3opt *S3Options) startS3Server() bool {
 		glog.V(0).Infof("Start Seaweed S3 API Server %s at http port %d", version.Version(), *s3opt.port)
 		if s3ApiLocalListener != nil {
 			go func() {
-				if err = httpS.Serve(s3ApiLocalListener); err != nil {
+				if err = newHttpServer(router, nil).Serve(s3ApiLocalListener); err != nil {
 					glog.Fatalf("S3 API Server Fail to serve: %v", err)
 				}
 			}()
 		}
-		if err = httpS.Serve(s3ApiListener); err != nil {
+		if err = newHttpServer(router, nil).Serve(s3ApiListener); err != nil {
 			glog.Fatalf("S3 API Server Fail to serve: %v", err)
 		}
 	}

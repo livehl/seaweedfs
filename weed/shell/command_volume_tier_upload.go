@@ -7,13 +7,18 @@ import (
 	"io"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
+
 	"github.com/seaweedfs/seaweedfs/weed/pb"
 
 	"google.golang.org/grpc"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb/master_pb"
 	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+
+	"github.com/seaweedfs/seaweedfs/weed/wdclient"
 )
 
 func init() {
@@ -69,6 +74,7 @@ func (c *commandVolumeTierUpload) Do(args []string, commandEnv *CommandEnv, writ
 	quietPeriod := tierCommand.Duration("quietFor", 24*time.Hour, "select volumes without no writes for this period")
 	dest := tierCommand.String("dest", "", "the target tier name")
 	keepLocalDatFile := tierCommand.Bool("keepLocalDatFile", false, "whether keep local dat file")
+	disk := tierCommand.String("disk", "", "[hdd|ssd|<tag>] hard drive or solid state drive or any tag")
 	if err = tierCommand.Parse(args); err != nil {
 		return nil
 	}
@@ -84,9 +90,15 @@ func (c *commandVolumeTierUpload) Do(args []string, commandEnv *CommandEnv, writ
 		return doVolumeTierUpload(commandEnv, writer, *collection, vid, *dest, *keepLocalDatFile)
 	}
 
+	var diskType *types.DiskType
+	if disk != nil {
+		_diskType := types.ToDiskType(*disk)
+		diskType = &_diskType
+	}
+
 	// apply to all volumes in the collection
 	// reusing collectVolumeIdsForEcEncode for now
-	volumeIds, err := collectVolumeIdsForEcEncode(commandEnv, *collection, *fullPercentage, *quietPeriod)
+	volumeIds, _, err := collectVolumeIdsForEcEncode(commandEnv, *collection, diskType, *fullPercentage, *quietPeriod, false)
 	if err != nil {
 		return err
 	}
@@ -102,9 +114,33 @@ func (c *commandVolumeTierUpload) Do(args []string, commandEnv *CommandEnv, writ
 
 func doVolumeTierUpload(commandEnv *CommandEnv, writer io.Writer, collection string, vid needle.VolumeId, dest string, keepLocalDatFile bool) (err error) {
 	// find volume location
-	existingLocations, found := commandEnv.MasterClient.GetLocationsClone(uint32(vid))
-	if !found {
-		return fmt.Errorf("volume %d not found", vid)
+	topoInfo, _, err := collectTopologyInfo(commandEnv, 0)
+	if err != nil {
+		return fmt.Errorf("collect topology info: %v", err)
+	}
+
+	var existingLocations []wdclient.Location
+	eachDataNode(topoInfo, func(dc DataCenterId, rack RackId, dn *master_pb.DataNodeInfo) {
+		for _, disk := range dn.DiskInfos {
+			for _, vi := range disk.VolumeInfos {
+				if needle.VolumeId(vi.Id) == vid && (collection == "" || vi.Collection == collection) {
+					fmt.Printf("find volume %d from Url:%s, GrpcPort:%d, DC:%s\n", vid, dn.Id, dn.GrpcPort, string(dc))
+					existingLocations = append(existingLocations, wdclient.Location{
+						Url:        dn.Id,
+						PublicUrl:  dn.Id,
+						GrpcPort:   int(dn.GrpcPort),
+						DataCenter: string(dc),
+					})
+				}
+			}
+		}
+	})
+
+	if len(existingLocations) == 0 {
+		if collection == "" {
+			return fmt.Errorf("volume %d not found", vid)
+		}
+		return fmt.Errorf("volume %d not found in collection %s", vid, collection)
 	}
 
 	err = markVolumeReplicasWritable(commandEnv.option.GrpcDialOption, vid, existingLocations, false, false)
@@ -127,7 +163,7 @@ func doVolumeTierUpload(commandEnv *CommandEnv, writer io.Writer, collection str
 		if i == 0 {
 			continue
 		}
-		fmt.Printf("delete volume %d from %s\n", vid, location.Url)
+		fmt.Printf("delete volume %d from Url:%s\n", vid, location.Url)
 		err = deleteVolume(commandEnv.option.GrpcDialOption, vid, location.ServerAddress(), false)
 		if err != nil {
 			return fmt.Errorf("deleteVolume %s volume %d: %v", location.Url, vid, err)
@@ -147,11 +183,15 @@ func uploadDatToRemoteTier(grpcDialOption grpc.DialOption, writer io.Writer, vol
 			KeepLocalDatFile:       keepLocalDatFile,
 		})
 
-		if stream == nil && copyErr == nil {
-			// when the volume is already uploaded, VolumeTierMoveDatToRemote will return nil stream and nil error
-			// so we should directly return in this case
-			fmt.Fprintf(writer, "volume %v already uploaded", volumeId)
-			return nil
+		if stream == nil {
+			if copyErr == nil {
+				// when the volume is already uploaded, VolumeTierMoveDatToRemote will return nil stream and nil error
+				// so we should directly return in this caseAdd commentMore actions
+				fmt.Fprintf(writer, "volume %v already uploaded", volumeId)
+				return nil
+			} else {
+				return copyErr
+			}
 		}
 		var lastProcessed int64
 		for {
